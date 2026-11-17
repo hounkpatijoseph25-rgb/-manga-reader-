@@ -164,6 +164,10 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
     _zoomed = false;
     _restorePage = 0;
     _pageNotifier.value = 0;
+    // Le chapitre précédent a pu laisser une progression affichée : on repart
+    // de zéro pour ne pas montrer une barre figée si le nouveau chapitre est
+    // déjà téléchargé (ou si le réseau est interdit).
+    _chapterPrefetch.value = null;
   }
 
   Future<void> _loadChapter() async {
@@ -378,12 +382,18 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
   /// cache, la mémoire reste donc stable même pour un webtoon de plusieurs
   /// centaines de pages.
   Future<void> _prefetchChapter(List<MangaPage> pages, int token) async {
-    if (!_mayUseNetwork()) return;
+    if (!_mayUseNetwork()) {
+      _chapterPrefetch.value = null;
+      return;
+    }
     final remote = [
       for (final page in pages)
         if (page.localPath == null && page.imageUrl.isNotEmpty) page,
     ];
-    if (remote.isEmpty) return;
+    if (remote.isEmpty) {
+      _chapterPrefetch.value = null;
+      return;
+    }
 
     _chapterPrefetch.value = 0;
     final manager = DefaultCacheManager();
