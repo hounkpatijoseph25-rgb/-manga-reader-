@@ -19,16 +19,26 @@ class ActiveDownload {
     required this.manga,
     required this.chapter,
     this.progress = 0,
+    this.attempts = 0,
+    this.nextAttemptAt,
   });
 
   final Manga manga;
   final Chapter chapter;
   final double progress;
 
+  /// Nombre d'essais déjà effectués (`0` = jamais tenté).
+  final int attempts;
+
+  /// Instant du prochain essai après un échec (`null` = dès que possible).
+  final DateTime? nextAttemptAt;
+
   ActiveDownload copyWith({double? progress}) => ActiveDownload(
     manga: manga,
     chapter: chapter,
     progress: progress ?? this.progress,
+    attempts: attempts,
+    nextAttemptAt: nextAttemptAt,
   );
 }
 
@@ -41,6 +51,8 @@ class DownloadsState {
     this.queued = const {},
     this.failed = const {},
     this.paused = false,
+    this.blockedKey,
+    this.waitingForNetwork = false,
   });
 
   final Set<String> done;
@@ -55,6 +67,15 @@ class DownloadsState {
   /// L'utilisateur a mis la file en pause.
   final bool paused;
 
+  /// Chapitre qui bloque la file : il a échoué, il sera réessayé
+  /// automatiquement, et la file **ne passe pas** au suivant avant qu'il
+  /// réussisse ou que l'utilisateur l'ignore.
+  final String? blockedKey;
+
+  /// La file attend une connexion autorisée (Wi-Fi, ou données mobiles si
+  /// l'utilisateur l'a permis dans les réglages).
+  final bool waitingForNetwork;
+
   bool get hasWork => active.isNotEmpty || queued.isNotEmpty;
 
   DownloadsState copyWith({
@@ -63,6 +84,9 @@ class DownloadsState {
     Map<String, ActiveDownload>? queued,
     Set<String>? failed,
     bool? paused,
+    String? blockedKey,
+    bool clearBlocked = false,
+    bool? waitingForNetwork,
   }) {
     return DownloadsState(
       done: done ?? this.done,
@@ -70,21 +94,28 @@ class DownloadsState {
       queued: queued ?? this.queued,
       failed: failed ?? this.failed,
       paused: paused ?? this.paused,
+      blockedKey: clearBlocked ? null : (blockedKey ?? this.blockedKey),
+      waitingForNetwork: waitingForNetwork ?? this.waitingForNetwork,
     );
   }
 }
 
-enum _JobResult { done, retry, cancelled }
+enum _JobResult { done, retry, cancelled, failed }
 
 /// Gère la file de téléchargement des chapitres.
 ///
-/// - **Un seul chapitre à la fois** : les pages d'un chapitre sont téléchargées
-///   en parallèle, mais le chapitre suivant attend que le précédent soit fini ;
+/// - **Un seul chapitre à la fois, dans l'ordre** : les pages d'un chapitre sont
+///   téléchargées en parallèle, mais le chapitre suivant attend que le précédent
+///   soit fini ;
+/// - **Un chapitre qui échoue bloque la file** : il est réessayé indéfiniment
+///   avec un délai croissant (5 s, 10 s, 20 s…) au lieu de passer au suivant.
+///   L'utilisateur peut l'ignorer depuis l'écran Téléchargements pour débloquer
+///   la file ;
 /// - La file est **persistée** en base locale : elle reprend automatiquement au
 ///   prochain démarrage après une coupure réseau, un arrêt de l'application ou
 ///   un redémarrage du téléphone ;
-/// - Un échec est **réessayé avec un backoff** (5 s, 10 s, 20 s…) au lieu de
-///   condamner le chapitre immédiatement ;
+/// - Elle **attend une connexion autorisée** : en données mobiles, rien n'est
+///   téléchargé sauf si l'utilisateur l'a permis dans les réglages ;
 /// - La file peut être **mise en pause**, **réordonnée** et des chapitres
 ///   peuvent être **arrêtés** sans toucher aux téléchargements terminés ;
 /// - Un service de premier plan Android garde le processus éveillé quand
@@ -93,16 +124,14 @@ class DownloadsNotifier extends Notifier<DownloadsState> {
   /// Nombre de chapitres téléchargés simultanément.
   static const int maxChapterConcurrency = 1;
 
-  /// Nombre d'essais d'un chapitre avant de le signaler en échec pour la
-  /// session en cours. Il reste dans la file persistée et sera retenté au
-  /// prochain lancement.
-  static const int maxJobAttempts = 8;
-
   static const List<int> _retrySeconds = [5, 10, 20, 40, 80, 160, 300];
   static const String _pausedKey = 'downloadsPaused';
 
   final List<DownloadJob> _queue = [];
   bool _running = false;
+
+  /// Dernier type de connexion connu (`null` = pas encore déterminé).
+  NetworkKind? _networkKind;
 
   /// Incrémenté par « Tout supprimer » pour ignorer un téléchargement qui se
   /// termine juste après le nettoyage.
@@ -122,7 +151,97 @@ class DownloadsNotifier extends Notifier<DownloadsState> {
   @override
   DownloadsState build() {
     final box = ref.read(storageProvider).settingsBox;
+    // La file suit le type de connexion : elle s'arrête dès que le réseau
+    // devient interdit (passage en données mobiles non autorisées, ou
+    // déconnexion) et repart seule quand une connexion autorisée revient.
+    ref.listen(networkKindProvider, (_, next) {
+      final kind = next.valueOrNull;
+      if (kind == null) return;
+      final wasAllowed = _mayDownload();
+      _networkKind = kind;
+      if (_mayDownload()) {
+        _setWaitingForNetwork(false);
+        _wakeLoop();
+        unawaited(_run());
+        return;
+      }
+      if (wasAllowed) {
+        _setWaitingForNetwork(true);
+        final token = _activeToken;
+        if (token != null && !token.isCancelled) {
+          token.cancel('Connexion non autorisée');
+        }
+        _wakeLoop();
+      }
+    });
+    // Autoriser les données mobiles pendant l'attente doit relancer la file.
+    ref.listen(settingsProvider.select((s) => s.downloadsOnMobileData), (_, _) {
+      if (_mayDownload()) {
+        _wakeLoop();
+        unawaited(_run());
+      }
+    });
     return DownloadsState(paused: box.get(_pausedKey) == true);
+  }
+
+  /// Vrai si la file a le droit de consommer du réseau maintenant.
+  ///
+  /// Le type de connexion encore inconnu (`null`) ne bloque pas : il arrive en
+  /// quelques millisecondes, et bloquer retarderait le démarrage pour rien.
+  bool _mayDownload() {
+    final kind = _networkKind;
+    if (kind == null) return true;
+    if (kind == NetworkKind.none) return false;
+    if (kind.isUnmetered) return true;
+    return ref.read(settingsProvider).downloadsOnMobileData;
+  }
+
+  void _setBlocked(String? key) {
+    if (state.blockedKey == key) return;
+    state = state.copyWith(blockedKey: key, clearBlocked: key == null);
+  }
+
+  void _setWaitingForNetwork(bool value) {
+    if (state.waitingForNetwork == value) return;
+    state = state.copyWith(waitingForNetwork: value);
+  }
+
+  /// Temps restant avant que ce chapitre puisse être retenté.
+  Duration _waitBefore(DownloadJob job) {
+    final next = job.nextAttemptAt;
+    if (next == null) return Duration.zero;
+    final wait = next.difference(DateTime.now());
+    return wait.isNegative ? Duration.zero : wait;
+  }
+
+  /// Retire un chapitre de la file (mémoire + base) sans toucher au disque.
+  Future<void> _dropFromQueue(String key) async {
+    final before = _queue.length;
+    _queue.removeWhere((job) => job.key == key);
+    if (_queue.length == before) return;
+    _renumberQueue();
+    await ref.read(downloadQueueRepositoryProvider).remove(key);
+  }
+
+  /// Le chapitre bloqué a pu être arrêté ou supprimé : le bandeau « Bloqué »
+  /// doit alors disparaître au lieu de rester affiché pour un chapitre absent.
+  void _clearBlockedIfGone() {
+    final key = state.blockedKey;
+    if (key == null) return;
+    if (_queue.any((job) => job.key == key)) return;
+    state = state.copyWith(blockedKey: null, clearBlocked: true);
+  }
+
+  /// Le chapitre bloqué reste **en tête** de file.
+  ///
+  /// La file ne passe pas au suivant tant qu'il n'a pas réussi : un tri ou un
+  /// déplacement manuel ne doit donc pas pouvoir le contourner.
+  void _pinBlocked() {
+    final key = state.blockedKey;
+    if (key == null) return;
+    final index = _queue.indexWhere((job) => job.key == key);
+    if (index <= 0) return;
+    _queue.insert(0, _queue.removeAt(index));
   }
 
   /// Clé d'un chapitre dans l'état ("source:id|idChapitre").
@@ -257,6 +376,7 @@ class DownloadsNotifier extends Notifier<DownloadsState> {
     if (target == index) return;
     final job = _queue.removeAt(index);
     _queue.insert(target, job);
+    _pinBlocked();
     _renumberQueue();
     state = state.copyWith(queued: _queuedFromQueue());
     unawaited(ref.read(downloadQueueRepositoryProvider).addAll(_queue));
@@ -277,6 +397,7 @@ class DownloadsNotifier extends Notifier<DownloadsState> {
       if (byManga != 0) return byManga;
       return a.chapter.id.compareTo(b.chapter.id);
     });
+    _pinBlocked();
     _renumberQueue();
     state = state.copyWith(queued: _queuedFromQueue());
     unawaited(ref.read(downloadQueueRepositoryProvider).addAll(_queue));
@@ -331,6 +452,7 @@ class DownloadsNotifier extends Notifier<DownloadsState> {
       queued: _queuedFromQueue(),
       failed: {...state.failed}..removeAll(keys),
     );
+    _clearBlockedIfGone();
     _wakeLoop();
     if (_queue.isEmpty && state.active.isEmpty) {
       unawaited(
@@ -352,11 +474,55 @@ class DownloadsNotifier extends Notifier<DownloadsState> {
     await stopJobs(keys);
   }
 
+  /// Ignore le chapitre qui bloque la file : ses fichiers partiels sont
+  /// supprimés et le chapitre suivant démarre immédiatement.
+  Future<void> ignoreBlocked() async {
+    final key = state.blockedKey;
+    if (key == null) return;
+    final job = _jobInQueue(key);
+    await _dropFromQueue(key);
+    if (job != null) {
+      await ref
+          .read(downloadServiceProvider)
+          .deleteChapter(job.manga, job.chapter);
+      await ref.read(downloadRepositoryProvider).remove(key);
+    }
+    state = state.copyWith(
+      blockedKey: null,
+      clearBlocked: true,
+      active: {...state.active}..remove(key),
+      queued: _queuedFromQueue(),
+      failed: {...state.failed}..remove(key),
+    );
+    _wakeLoop();
+    unawaited(_run());
+  }
+
+  /// Relance tout de suite le chapitre bloqué, sans attendre son délai.
+  void retryBlockedNow() {
+    final key = state.blockedKey;
+    if (key == null) return;
+    final index = _queue.indexWhere((job) => job.key == key);
+    if (index < 0) return;
+    _queue[index] = _queue[index].copyWith(clearNextAttemptAt: true);
+    state = state.copyWith(
+      blockedKey: null,
+      clearBlocked: true,
+      queued: _queuedFromQueue(),
+    );
+    _wakeLoop();
+    unawaited(_run());
+  }
+
   static String _pendingText(int count) =>
       '$count chapitre${count > 1 ? 's' : ''} en attente';
 
-  /// Total des chapitres pas encore terminés (actif + file).
-  int get _remaining => _queue.length + state.active.length;
+  /// Total des chapitres pas encore terminés.
+  ///
+  /// Le chapitre en cours reste dans `_queue` pendant son téléchargement : la
+  /// file est donc la seule source de vérité (compter aussi `state.active`
+  /// l'aurait compté deux fois).
+  int get _remaining => _queue.length;
 
   int get _nextOrder {
     var max = -1;
@@ -403,32 +569,39 @@ class DownloadsNotifier extends Notifier<DownloadsState> {
     if (wake != null && !wake.isCompleted) wake.complete();
   }
 
-  /// Traite la file, **un chapitre à la fois**.
+  /// Traite la file, **un chapitre à la fois et dans l'ordre**.
+  ///
+  /// Le premier chapitre de la file est le seul candidat : tant qu'il n'est pas
+  /// terminé (ou ignoré par l'utilisateur), les suivants n'avancent pas.
   Future<void> _run() async {
     if (_running || state.paused) return;
     _running = true;
     try {
       while (_queue.isNotEmpty && !state.paused) {
-        final now = DateTime.now();
-        final index = _queue.indexWhere(
-          (job) =>
-              job.nextAttemptAt == null || !job.nextAttemptAt!.isAfter(now),
-        );
-        if (index < 0) {
-          // Tous les chapitres restants attendent leur backoff : on dort par
-          // petits pas pour pouvoir démarrer un ajout manuel sans attendre.
-          final next = _queue
-              .map((job) => job.nextAttemptAt!)
-              .reduce((a, b) => a.isBefore(b) ? a : b);
-          final wait = next.difference(now);
-          final sleep = wait > const Duration(seconds: 5)
-              ? const Duration(seconds: 5)
-              : wait;
-          await _sleep(sleep);
+        // Réseau interdit (données mobiles désactivées, ou hors connexion) :
+        // la file patiente sans rien consommer.
+        if (!_mayDownload()) {
+          _setWaitingForNetwork(true);
+          await _sleep(const Duration(seconds: 5));
+          continue;
+        }
+        _setWaitingForNetwork(false);
+
+        final job = _queue.first;
+        final wait = _waitBefore(job);
+        if (wait > Duration.zero) {
+          // Échec précédent : le chapitre garde la tête de file et bloque la
+          // suite jusqu'à ce qu'il réussisse ou soit ignoré.
+          _setBlocked(job.key);
+          await _sleep(
+            wait > const Duration(seconds: 5)
+                ? const Duration(seconds: 5)
+                : wait,
+          );
           continue;
         }
 
-        final job = _queue.removeAt(index);
+        _setBlocked(null);
         final generation = _generation;
         final token = CancelToken();
         _activeJob = job;
@@ -446,43 +619,52 @@ class DownloadsNotifier extends Notifier<DownloadsState> {
         if (generation != _generation) {
           // « Tout supprimer » est passé pendant le téléchargement : le
           // chapitre a pu être réécrit sur le disque après le nettoyage.
+          await _dropFromQueue(job.key);
           await _cleanupFilesOnly(job);
           continue;
         }
 
         if (result == _JobResult.cancelled) {
           if (_stoppedKeys.remove(job.key)) {
+            await _dropFromQueue(job.key);
             await _cleanupStopped(job);
             continue;
           }
+          // Pause ou connexion coupée : le chapitre reprend en tête de file,
+          // sans compter d'échec.
           await _requeuePaused(job);
           continue;
         }
         if (result == _JobResult.done) {
+          await _dropFromQueue(job.key);
           // L'arrêt a pu être demandé pendant l'écriture de l'index final.
           if (_stoppedKeys.remove(job.key)) {
             await _cleanupStopped(job);
           }
           continue;
         }
-
-        final attempts = job.attempts + 1;
-        if (attempts >= maxJobAttempts) {
+        if (result == _JobResult.failed) {
+          // Erreur définitive (source introuvable) : réessayer ne servirait à
+          // rien, on retire le chapitre au lieu de bloquer la file pour rien.
+          await _dropFromQueue(job.key);
           _markFailed(job);
-          // La tâche reste dans la file persistée : au prochain lancement,
-          // `resumePending` lui redonnera des essais. On ne bloque pas la
-          // session en cours derrière un chapitre durablement cassé.
           continue;
         }
 
+        // Échec passager : le chapitre reste **en tête** de file et sera
+        // réessayé indéfiniment (délai croissant). La file ne passe pas au
+        // suivant : l'utilisateur peut l'ignorer pour la débloquer.
+        final attempts = job.attempts + 1;
         final retry = job.copyWith(
           attempts: attempts,
           nextAttemptAt: DateTime.now().add(_retryDelay(attempts)),
-          order: _nextOrder,
         );
-        _queue.add(retry);
+        _queue.removeWhere((queued) => queued.key == job.key);
+        _queue.insert(0, retry);
+        _renumberQueue();
         await ref.read(downloadQueueRepositoryProvider).addAll([retry]);
         _markQueued(retry);
+        _setBlocked(retry.key);
         unawaited(
           BackgroundDownloads.update(
             title: 'Téléchargements ($_remaining)',
@@ -531,7 +713,10 @@ class DownloadsNotifier extends Notifier<DownloadsState> {
         return _JobResult.done;
       }
       final source = ref.read(sourceByIdProvider(job.manga.sourceId));
-      if (source == null) throw StateError('Source introuvable.');
+      if (source == null) {
+        // Erreur définitive : réessayer ne changerait jamais le résultat.
+        return _JobResult.failed;
+      }
 
       unawaited(
         BackgroundDownloads.update(
@@ -649,7 +834,12 @@ class DownloadsNotifier extends Notifier<DownloadsState> {
 
   Map<String, ActiveDownload> _queuedFromQueue() => {
     for (final job in _queue)
-      job.key: ActiveDownload(manga: job.manga, chapter: job.chapter),
+      job.key: ActiveDownload(
+        manga: job.manga,
+        chapter: job.chapter,
+        attempts: job.attempts,
+        nextAttemptAt: job.nextAttemptAt,
+      ),
   };
 
   void _markActive(DownloadJob job) {
@@ -669,7 +859,12 @@ class DownloadsNotifier extends Notifier<DownloadsState> {
       active: {...state.active}..remove(key),
       queued: {
         ...state.queued,
-        key: ActiveDownload(manga: job.manga, chapter: job.chapter),
+        key: ActiveDownload(
+          manga: job.manga,
+          chapter: job.chapter,
+          attempts: job.attempts,
+          nextAttemptAt: job.nextAttemptAt,
+        ),
       },
     );
   }
@@ -726,6 +921,7 @@ class DownloadsNotifier extends Notifier<DownloadsState> {
       queued: {...state.queued}..remove(key),
       failed: {...state.failed}..remove(key),
     );
+    _clearBlockedIfGone();
     if (_queue.isEmpty && !_running) {
       unawaited(
         BackgroundDownloads.stop(shouldStop: () => _queue.isEmpty && !_running),

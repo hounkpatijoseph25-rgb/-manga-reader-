@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -134,6 +136,22 @@ class _DownloadsScreenState extends ConsumerState<DownloadsScreen> {
                   ),
                 ],
               ),
+            ),
+          if (state.waitingForNetwork)
+            const _NoticeBanner(
+              icon: Icons.wifi_off_rounded,
+              message:
+                  'En attente d\'une connexion autorisée : les téléchargements '
+                  'reprendront automatiquement.',
+            ),
+          if (state.blockedKey != null && !state.waitingForNetwork)
+            _BlockedBanner(
+              attempts: state.queued[state.blockedKey]?.attempts ?? 0,
+              nextAttemptAt: state.queued[state.blockedKey]?.nextAttemptAt,
+              onRetry: () =>
+                  ref.read(downloadsProvider.notifier).retryBlockedNow(),
+              onIgnore: () =>
+                  ref.read(downloadsProvider.notifier).ignoreBlocked(),
             ),
           if (state.active.isNotEmpty) ...[
             _SectionTitle('En cours (${state.active.length})'),
@@ -678,6 +696,138 @@ class _CompactIconButton extends StatelessWidget {
       padding: EdgeInsets.zero,
       constraints: const BoxConstraints.tightFor(width: 32, height: 38),
       onPressed: onPressed,
+    );
+  }
+}
+
+/// Message discret d'information en tête de la file (réseau, pause…).
+class _NoticeBanner extends StatelessWidget {
+  const _NoticeBanner({required this.icon, required this.message});
+
+  final IconData icon;
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      child: Row(
+        children: [
+          Icon(icon, size: 20, color: scheme.primary),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              message,
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(color: scheme.primary),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Bandeau du chapitre qui bloque la file.
+///
+/// Le chapitre échoue, il est réessayé tout seul avec un délai de plus en plus
+/// long, et **les chapitres suivants ne démarrent pas**. L'utilisateur peut
+/// relancer immédiatement ou ignorer ce chapitre pour débloquer la file.
+class _BlockedBanner extends StatefulWidget {
+  const _BlockedBanner({
+    required this.attempts,
+    required this.nextAttemptAt,
+    required this.onRetry,
+    required this.onIgnore,
+  });
+
+  final int attempts;
+  final DateTime? nextAttemptAt;
+  final VoidCallback onRetry;
+  final VoidCallback onIgnore;
+
+  @override
+  State<_BlockedBanner> createState() => _BlockedBannerState();
+}
+
+class _BlockedBannerState extends State<_BlockedBanner> {
+  Timer? _ticker;
+
+  @override
+  void initState() {
+    super.initState();
+    // Le compte à rebours doit avancer même si l'état de la file ne bouge pas.
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  String get _countdown {
+    final next = widget.nextAttemptAt;
+    if (next == null) return 'nouvel essai immédiat';
+    final left = next.difference(DateTime.now());
+    if (left.isNegative) return 'nouvel essai en cours…';
+    if (left.inSeconds < 60) return 'nouvel essai dans ${left.inSeconds} s';
+    return 'nouvel essai dans ${(left.inSeconds / 60).ceil()} min';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      child: Card(
+        color: scheme.errorContainer,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    Icons.error_outline,
+                    size: 20,
+                    color: scheme.onErrorContainer,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Chapitre bloqué (essai ${widget.attempts}) : la file ne '
+                      'passe pas au suivant.\n$_countdown.',
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: scheme.onErrorContainer,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    onPressed: widget.onRetry,
+                    child: const Text('Réessayer'),
+                  ),
+                  TextButton(
+                    onPressed: widget.onIgnore,
+                    child: const Text('Ignorer ce chapitre'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

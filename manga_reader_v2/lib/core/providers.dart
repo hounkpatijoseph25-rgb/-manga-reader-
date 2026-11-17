@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:dio/dio.dart';
 import 'package:dio/io.dart';
 import 'package:flutter/material.dart' show ThemeMode;
@@ -240,6 +241,10 @@ class SettingsNotifier extends Notifier<AppSettings> {
   void setDownloadsDirMode(String mode) =>
       _update(state.copyWith(downloadsDirMode: mode));
 
+  /// Autoriser les téléchargements en données mobiles.
+  void setDownloadsOnMobileData(bool value) =>
+      _update(state.copyWith(downloadsOnMobileData: value));
+
   void setShowNsfw(bool value) => _update(state.copyWith(showNsfw: value));
 
   void setNotificationsEnabled(bool value) =>
@@ -268,6 +273,44 @@ final dioProvider = Provider<Dio>((ref) {
       headers: {'User-Agent': AppConstants.userAgent},
     ),
   );
+});
+
+/// Type de connexion réseau actif (Wi-Fi, données mobiles, …).
+enum NetworkKind { none, wifi, ethernet, mobile, other }
+
+extension NetworkKindX on NetworkKind {
+  /// Vrai pour une connexion non facturée au volume (Wi-Fi, Ethernet).
+  bool get isUnmetered =>
+      this == NetworkKind.wifi || this == NetworkKind.ethernet;
+}
+
+NetworkKind _networkKindFrom(List<ConnectivityResult> results) {
+  if (results.contains(ConnectivityResult.wifi)) return NetworkKind.wifi;
+  if (results.contains(ConnectivityResult.ethernet)) {
+    return NetworkKind.ethernet;
+  }
+  if (results.contains(ConnectivityResult.mobile)) return NetworkKind.mobile;
+  if (results.contains(ConnectivityResult.none) || results.isEmpty) {
+    return NetworkKind.none;
+  }
+  return NetworkKind.other;
+}
+
+/// Suit le type de connexion : la file de téléchargement s'en sert pour ne pas
+/// consommer de données mobiles quand l'utilisateur l'a interdit.
+final networkKindProvider = StreamProvider<NetworkKind>((ref) {
+  final connectivity = Connectivity();
+  Stream<NetworkKind> kinds() async* {
+    try {
+      yield _networkKindFrom(await connectivity.checkConnectivity());
+    } catch (_) {
+      // Plateforme indisponible : on laisse la file démarrer.
+      yield NetworkKind.other;
+    }
+    yield* connectivity.onConnectivityChanged.map(_networkKindFrom);
+  }
+
+  return kinds().distinct();
 });
 
 /// Client dédié aux images de chapitres : plus de connexions simultanées que

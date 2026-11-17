@@ -271,6 +271,15 @@ class SettingsScreen extends ConsumerWidget {
                   ),
             onTap: () => _pickDownloadsDir(context, ref),
           ),
+          SwitchListTile(
+            secondary: const Icon(Icons.signal_cellular_alt),
+            title: const Text('Télécharger en données mobiles'),
+            subtitle: const Text(
+              'Désactivé : la file attend une connexion Wi-Fi',
+            ),
+            value: settings.downloadsOnMobileData,
+            onChanged: notifier.setDownloadsOnMobileData,
+          ),
 
           // ------------------------------------------------- bibliothèque locale
           const _SectionTitle('Bibliothèque locale'),

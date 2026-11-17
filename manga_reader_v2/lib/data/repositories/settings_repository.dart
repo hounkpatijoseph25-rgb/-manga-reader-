@@ -47,6 +47,7 @@ class AppSettings {
     this.downloadsDir = '',
     this.showNsfw = false,
     this.downloadsDirMode = 'unset',
+    this.downloadsOnMobileData = false,
     this.notificationsEnabled = true,
     this.keepScreenOn = true,
     this.readerBrightness = -1,
@@ -79,6 +80,10 @@ class AppSettings {
   /// Choix du dossier de téléchargements : `unset`, `internal` ou `custom`.
   final String downloadsDirMode;
 
+  /// Autoriser les téléchargements en données mobiles (désactivé par défaut :
+  /// la file attend le Wi-Fi).
+  final bool downloadsOnMobileData;
+
   /// Prévenir par une notification quand la veille découvre des chapitres.
   final bool notificationsEnabled;
 
@@ -102,6 +107,7 @@ class AppSettings {
     String? downloadsDir,
     bool? showNsfw,
     String? downloadsDirMode,
+    bool? downloadsOnMobileData,
     bool? notificationsEnabled,
     bool? keepScreenOn,
     double? readerBrightness,
@@ -121,6 +127,8 @@ class AppSettings {
       downloadsDir: downloadsDir ?? this.downloadsDir,
       showNsfw: showNsfw ?? this.showNsfw,
       downloadsDirMode: downloadsDirMode ?? this.downloadsDirMode,
+      downloadsOnMobileData:
+          downloadsOnMobileData ?? this.downloadsOnMobileData,
       notificationsEnabled: notificationsEnabled ?? this.notificationsEnabled,
       keepScreenOn: keepScreenOn ?? this.keepScreenOn,
       readerBrightness: readerBrightness ?? this.readerBrightness,
@@ -181,6 +189,8 @@ class SettingsRepository {
       downloadsDir: downloadsDir,
       showNsfw: (_box.get('showNsfw') as bool?) ?? false,
       downloadsDirMode: downloadsDirMode,
+      downloadsOnMobileData:
+          (_box.get('downloadsOnMobileData') as bool?) ?? false,
       notificationsEnabled: (_box.get('notificationsEnabled') as bool?) ?? true,
       keepScreenOn: (_box.get('keepScreenOn') as bool?) ?? true,
       readerBrightness: (_box.get('readerBrightness') as num?)?.toDouble() ?? -1,
@@ -209,6 +219,7 @@ class SettingsRepository {
       'downloadsDir': s.downloadsDir,
       'showNsfw': s.showNsfw,
       'downloadsDirMode': s.downloadsDirMode,
+      'downloadsOnMobileData': s.downloadsOnMobileData,
       'notificationsEnabled': s.notificationsEnabled,
       'keepScreenOn': s.keepScreenOn,
       'readerBrightness': s.readerBrightness,

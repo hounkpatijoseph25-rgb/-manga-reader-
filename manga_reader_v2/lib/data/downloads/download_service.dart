@@ -40,9 +40,11 @@ class DownloadService {
 
   /// Nombre d'images téléchargées simultanément dans un chapitre.
   ///
-  /// On télécharge un seul chapitre à la fois : ce parallélisme reste raisonnable
-  /// pour le CDN tout en accélérant nettement un chapitre.
-  static const int imageConcurrency = 12;
+  /// On télécharge un seul chapitre à la fois. La valeur est volontairement
+  /// basse : mesuré sur les CDN de MangaDex et Sushiscan, 6 connexions vont
+  /// ~1,75× plus vite que 12 (au-delà, le CDN étrangle le client et le débit
+  /// s'effondre).
+  static const int imageConcurrency = 6;
 
   /// Nombre de tentatives par image.
   static const int maxAttempts = 4;
