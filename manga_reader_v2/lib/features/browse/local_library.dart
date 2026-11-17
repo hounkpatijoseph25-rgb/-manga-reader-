@@ -12,6 +12,7 @@ import '../../core/utils/storage_access.dart';
 import '../../data/models/manga.dart';
 import '../../data/sources/local_source.dart';
 import '../details/details_providers.dart';
+import 'browse_providers.dart';
 
 /// Vérifie l'accès « tous les fichiers » et propose de l'accorder.
 ///
@@ -71,6 +72,7 @@ Future<void> pickLocalRoot(BuildContext context, WidgetRef ref) async {
 
   ref.read(settingsProvider.notifier).setLocalRoot(path);
   ref.invalidate(localSourceProvider);
+  _reloadLocalCatalog(ref);
   if (!context.mounted) return;
 
   if (!StorageAccess.canRead(path)) {
@@ -87,7 +89,16 @@ Future<void> pickLocalRoot(BuildContext context, WidgetRef ref) async {
 void forgetLocalRoot(BuildContext context, WidgetRef ref) {
   ref.read(settingsProvider.notifier).setLocalRoot('');
   ref.invalidate(localSourceProvider);
+  _reloadLocalCatalog(ref);
   _snack(context, 'Dossier local oublié');
+}
+
+/// Force le catalogue de la bibliothèque locale à se recharger quand le dossier
+/// change, pour que les mangas/webtoons apparaissent sans autre action.
+void _reloadLocalCatalog(WidgetRef ref) {
+  if (ref.read(catalogProvider).sourceId == 'local') {
+    ref.read(catalogProvider.notifier).refresh();
+  }
 }
 
 /// Choix de l'image de présentation d'un manga/webtoon local.

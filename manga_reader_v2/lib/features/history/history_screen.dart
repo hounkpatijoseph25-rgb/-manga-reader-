@@ -55,9 +55,22 @@ class HistoryScreen extends ConsumerWidget {
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                 ),
-                subtitle: Text(
-                  '${entry.chapterTitle} · page ${entry.page + 1}\n'
-                  '${formatRelative(entry.readAt)}',
+                subtitle: Text.rich(
+                  TextSpan(
+                    children: [
+                      TextSpan(text: '${entry.chapterTitle} · '),
+                      // La page en cours a une couleur distincte du nom du
+                      // chapitre : on repère où on s'est arrêté d'un coup d'œil.
+                      TextSpan(
+                        text: 'page ${entry.page + 1}',
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.primary,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      TextSpan(text: '\n${formatRelative(entry.readAt)}'),
+                    ],
+                  ),
                 ),
                 isThreeLine: true,
                 trailing: IconButton(

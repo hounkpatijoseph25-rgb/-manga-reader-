@@ -1,10 +1,13 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:screen_brightness/screen_brightness.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../../core/providers.dart';
 import '../../core/utils/errors.dart';
@@ -23,7 +26,13 @@ import 'zoomable_view.dart';
 /// - Appui au centre : affiche / masque les barres.
 /// - Appui sur les bords (modes horizontaux) : page précédente / suivante.
 /// - Pincer : zoom (modes horizontaux).
-/// - La dernière page lue est enregistrée quand on quitte le chapitre.
+/// - La position (page ou défilement webtoon) est enregistrée en continu.
+///
+/// Mode webtoon : défilement vertical continu, plein écran, sans rebond ni
+/// « remontée » accidentelle. La position est suivie par index de page (via
+/// [ScrollablePositionedList]) et non par pixels : la page courante reste donc
+/// exacte malgré les hauteurs variables des images, et la reprise à l'ouverture
+/// retombe précisément sur la bonne page.
 class ReaderScreen extends ConsumerStatefulWidget {
   const ReaderScreen({
     super.key,
@@ -57,10 +66,27 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
   bool _zoomed = false;
   int _loadToken = 0;
 
+  /// Page courante diffusée uniquement à la barre du bas.
+  ///
+  /// En mode webtoon la page change à chaque écran parcouru : un `setState`
+  /// reconstruirait tout le lecteur (barres, liste, images) plusieurs fois par
+  /// seconde pendant le défilement — c'est la principale cause de saccade.
+  final ValueNotifier<int> _pageNotifier = ValueNotifier<int>(0);
+
   PageController? _pageController;
-  ItemScrollController _itemScroll = ItemScrollController();
-  ItemPositionsListener _itemPositions = ItemPositionsListener.create();
   List<List<int>> _spreads = const [];
+
+  // --- Mode webtoon ---------------------------------------------------------
+  /// Suit la position de défilement par index de page (et non par pixels) : la
+  /// page courante reste exacte même quand les hauteurs réelles des images
+  /// diffèrent des estimations, et la restauration est précise.
+  final ItemScrollController _itemScrollController = ItemScrollController();
+  final ItemPositionsListener _itemPositionsListener =
+      ItemPositionsListener.create();
+
+  /// Page à restaurer au premier affichage du chapitre.
+  int _restorePage = 0;
+  Timer? _saveDebounce;
 
   Chapter get _chapter => widget.chapters[_chapterIndex];
   int get _count => _pages?.length ?? 0;
@@ -73,16 +99,38 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
     _historyRepo = ref.read(historyRepositoryProvider);
     _chapterIndex = widget.initialIndex;
     _mode = ref.read(settingsProvider).readerMode;
-    _itemPositions.itemPositions.addListener(_onPositions);
+    _itemPositionsListener.itemPositions.addListener(_onPositionsChanged);
+    _applyScreenPreferences();
     _loadChapter();
+  }
+
+  /// Garde l'écran allumé et applique la luminosité choisie pour le lecteur.
+  void _applyScreenPreferences() {
+    final settings = ref.read(settingsProvider);
+    if (settings.keepScreenOn) {
+      WakelockPlus.enable().ignore();
+    }
+    final brightness = settings.readerBrightness;
+    if (brightness >= 0) {
+      ScreenBrightness().setApplicationScreenBrightness(brightness).ignore();
+    }
+  }
+
+  /// Rend la luminosité au système (à la fermeture du lecteur).
+  void _restoreScreenPreferences() {
+    WakelockPlus.disable().ignore();
+    ScreenBrightness().resetApplicationScreenBrightness().ignore();
   }
 
   @override
   void dispose() {
-    _saveProgress(); // sauvegarde de la dernière page lue
+    _saveDebounce?.cancel();
+    _saveProgress(); // sauvegarde de la position
     WidgetsBinding.instance.removeObserver(this);
-    _itemPositions.itemPositions.removeListener(_onPositions);
+    _itemPositionsListener.itemPositions.removeListener(_onPositionsChanged);
+    _pageNotifier.dispose();
     _pageController?.dispose();
+    _restoreScreenPreferences();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
   }
@@ -100,6 +148,8 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
     _page = 0;
     _reachedEnd = false;
     _zoomed = false;
+    _restorePage = 0;
+    _pageNotifier.value = 0;
   }
 
   Future<void> _loadChapter() async {
@@ -128,18 +178,18 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
         throw StateError('Ce chapitre ne contient aucune page.');
       }
 
-      // Reprise à la dernière page lue (sauf si le chapitre est déjà terminé).
+      // Reprise : page à restaurer (l'index suffit, tous modes confondus).
       final progress = _progressRepo.get(manga.key);
-      final start = progress.isRead(chapter.id)
-          ? 0
-          : progress.pageOf(chapter.id);
+      final read = progress.isRead(chapter.id);
+      _restorePage = read ? 0 : progress.pageOf(chapter.id);
 
       setState(() {
         _pages = pages;
-        _page = clampInt(start, 0, pages.length - 1);
+        _page = clampInt(_restorePage, 0, pages.length - 1);
+        _pageNotifier.value = _page;
         _setupControllers();
       });
-      _historyRepo.record(manga, chapter, _page);
+      unawaited(_historyRepo.record(manga, chapter, _page));
       _precacheAround(_page);
     } catch (e) {
       if (!mounted || token != _loadToken) return;
@@ -154,11 +204,6 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
       WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
     }
     _pageController = null;
-
-    _itemPositions.itemPositions.removeListener(_onPositions);
-    _itemScroll = ItemScrollController();
-    _itemPositions = ItemPositionsListener.create();
-    _itemPositions.itemPositions.addListener(_onPositions);
 
     _zoomed = false;
     _spreads = _buildSpreads(_count);
@@ -191,19 +236,28 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
 
   // -------------------------------------------------------------- progression
 
-  /// Mode webtoon : on déduit la page courante des éléments visibles.
-  void _onPositions() {
+  /// En mode webtoon, la page courante est celle qui couvre le haut de l'écran
+  /// (celle dont le bord supérieur est visible), sinon la première encore
+  /// visible. On repère aussi l'écran de fin de chapitre pour marquer « lu ».
+  void _onPositionsChanged() {
     if (_mode != ReaderMode.webtoon || _pages == null) return;
-    final positions = _itemPositions.itemPositions.value;
-    var first = -1;
-    var last = 0;
+    final positions = _itemPositionsListener.itemPositions.value;
+    if (positions.isEmpty) return;
+    int? current;
+    var atEnd = false;
     for (final p in positions) {
-      if (p.itemTrailingEdge <= 0.02) continue;
-      if (first == -1 || p.index < first) first = p.index;
-      if (p.index > last) last = p.index;
+      if (p.itemLeadingEdge <= 0 && p.itemTrailingEdge > 0) {
+        current = p.index;
+      }
+      if (p.index >= _count && p.itemLeadingEdge < 1) {
+        atEnd = true;
+      }
     }
-    if (first == -1) return;
-    _setPage(first, reachedEnd: last >= _count - 1);
+    // À défaut de page couvrant le haut, on prend la première visible.
+    current ??= positions.map((p) => p.index).reduce((a, b) => a < b ? a : b);
+    if (current >= _count) current = _count - 1;
+    _setPage(current, reachedEnd: atEnd);
+    _scheduleSave();
   }
 
   /// Modes horizontaux : le PageView nous dit sur quel "écran" on est.
@@ -222,12 +276,24 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
     final p = clampInt(page, 0, _count - 1);
     final becameEnd = reachedEnd && !_reachedEnd;
     if (p == _page && !becameEnd) return;
-    setState(() {
-      _page = p;
-      if (reachedEnd) _reachedEnd = true;
-    });
+    _page = p;
+    if (reachedEnd) _reachedEnd = true;
+    // Pas de setState : seul l'indicateur du bas écoute la page courante, le
+    // contenu (liste d'images) n'est pas reconstruit pendant le défilement.
+    _pageNotifier.value = p;
     _precacheAround(p);
     if (becameEnd) _saveProgress();
+  }
+
+  /// Sauvegarde différée (2 s) pendant le défilement, pour ne pas écrire à
+  /// chaque pixel tout en gardant une position à jour.
+  void _scheduleSave() {
+    // Un seul minuteur réutilisé : `_onWebtoonScroll` est appelé à chaque image
+    // affichée, créer un Timer à chaque fois allouait inutilement en continu.
+    _saveDebounce ??= Timer(const Duration(seconds: 2), () {
+      _saveDebounce = null;
+      _saveProgress();
+    });
   }
 
   Future<void> _saveProgress() async {
@@ -248,10 +314,14 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
   void _precacheAround(int page) {
     final pages = _pages;
     if (pages == null || !mounted) return;
-    // Une seule page d'avance (et la précédente) : charger 4 pages d'un coup
-    // sature la mémoire et ralentit l'affichage des grandes images.
-    for (final offset in const [1, -1]) {
-      final i = page + offset;
+    // On se limite aux voisines immédiates : décoder davantage d'images en même
+    // temps (surtout des webtoons très hauts) saturait la mémoire et provoquait
+    // des saccades.
+    final offsets = _mode == ReaderMode.webtoon
+        ? const [1, 2]
+        : const [1, -1];
+    for (final o in offsets) {
+      final i = page + o;
       if (i < 0 || i >= pages.length) continue;
       final p = pages[i];
       final local = p.localPath;
@@ -304,7 +374,8 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
   void _seekTo(int page) {
     final p = clampInt(page, 0, _count - 1);
     if (_mode == ReaderMode.webtoon) {
-      _itemScroll.jumpTo(index: p);
+      if (!_itemScrollController.isAttached) return;
+      _itemScrollController.jumpTo(index: p);
     } else {
       _pageController?.jumpToPage(_spreadIndexOfPage(p));
     }
@@ -319,7 +390,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
       _chapterIndex = next;
       _resetForLoad();
     });
-    _loadChapter();
+    unawaited(_loadChapter());
   }
 
   Future<void> _pickMode() async {
@@ -333,6 +404,8 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
     ref.read(settingsProvider.notifier).setReaderMode(picked);
     setState(() {
       _mode = picked;
+      // Changement de mode en cours de chapitre : on repart de la page courante.
+      _restorePage = _page;
       _setupControllers();
     });
   }
@@ -442,54 +515,63 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
         top: false,
         child: Padding(
           padding: const EdgeInsets.fromLTRB(8, 4, 8, 4),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                count == 0 ? '' : '${_page + 1} / $count',
-                style: const TextStyle(color: Colors.white70, fontSize: 12),
-              ),
-              Row(
-                children: [
-                  IconButton(
-                    icon: const Icon(Icons.skip_previous, color: Colors.white),
-                    tooltip: 'Chapitre précédent',
-                    onPressed: _chapterIndex > 0
-                        ? () => _changeChapter(-1)
-                        : null,
-                  ),
-                  Expanded(
-                    // En lecture droite → gauche, le curseur avance aussi vers la gauche.
-                    child: Directionality(
-                      textDirection: _mode.isRtl
-                          ? TextDirection.rtl
-                          : TextDirection.ltr,
-                      child: Slider(
-                        value: canSeek ? _page.toDouble() : 0,
-                        min: 0,
-                        max: canSeek ? (count - 1).toDouble() : 1,
-                        divisions: canSeek ? count - 1 : null,
-                        onChanged: canSeek
-                            ? (v) {
-                                final p = v.round();
-                                if (p == _page) return;
-                                setState(() => _page = p);
-                                _seekTo(p);
-                              }
-                            : null,
+          // L'indicateur et le curseur écoutent [_pageNotifier] : le défilement
+          // ne reconstruit donc que cette petite zone, pas tout le lecteur.
+          child: ValueListenableBuilder<int>(
+            valueListenable: _pageNotifier,
+            builder: (context, page, _) => Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  count == 0 ? '' : '${page + 1} / $count',
+                  style: const TextStyle(color: Colors.white70, fontSize: 12),
+                ),
+                Row(
+                  children: [
+                    IconButton(
+                      icon: const Icon(
+                        Icons.skip_previous,
+                        color: Colors.white,
+                      ),
+                      tooltip: 'Chapitre précédent',
+                      onPressed: _chapterIndex > 0
+                          ? () => _changeChapter(-1)
+                          : null,
+                    ),
+                    Expanded(
+                      // En lecture droite → gauche, le curseur avance aussi vers la gauche.
+                      child: Directionality(
+                        textDirection: _mode.isRtl
+                            ? TextDirection.rtl
+                            : TextDirection.ltr,
+                        child: Slider(
+                          value: canSeek ? page.toDouble() : 0,
+                          min: 0,
+                          max: canSeek ? (count - 1).toDouble() : 1,
+                          divisions: canSeek ? count - 1 : null,
+                          onChanged: canSeek
+                              ? (v) {
+                                  final p = v.round();
+                                  if (p == page) return;
+                                  _page = p;
+                                  _pageNotifier.value = p;
+                                  _seekTo(p);
+                                }
+                              : null,
+                        ),
                       ),
                     ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.skip_next, color: Colors.white),
-                    tooltip: 'Chapitre suivant',
-                    onPressed: _chapterIndex < widget.chapters.length - 1
-                        ? () => _changeChapter(1)
-                        : null,
-                  ),
-                ],
-              ),
-            ],
+                    IconButton(
+                      icon: const Icon(Icons.skip_next, color: Colors.white),
+                      tooltip: 'Chapitre suivant',
+                      onPressed: _chapterIndex < widget.chapters.length - 1
+                          ? () => _changeChapter(1)
+                          : null,
+                    ),
+                  ],
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -532,25 +614,36 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
   }
 
   /// Défilement vertical continu (idéal pour les manhwas).
+  ///
+  /// [ScrollablePositionedList] suit la position par index de page : la page
+  /// courante (barre du bas) reste donc exacte malgré les hauteurs variables des
+  /// images, et l'ouverture repart précisément sur la page mémorisée grâce à
+  /// [initialScrollIndex].
   Widget _webtoon(List<MangaPage> pages) {
     final height = MediaQuery.of(context).size.height;
     return GestureDetector(
       behavior: HitTestBehavior.translucent,
       onTap: _toggleBars,
-      child: ScrollablePositionedList.builder(
-        key: ValueKey('webtoon-$_chapterIndex'),
-        itemCount: pages.length + 1, // +1 : l'écran de fin de chapitre
-        initialScrollIndex: _page,
-        itemScrollController: _itemScroll,
-        itemPositionsListener: _itemPositions,
-        itemBuilder: (context, i) {
-          if (i >= pages.length) return _chapterEnd(height * 0.8);
-          return _PageImage(
-            page: pages[i],
-            fit: BoxFit.fitWidth,
-            placeholderHeight: height * 0.6,
-          );
-        },
+      child: ScrollConfiguration(
+        behavior: const _NoGlowScrollBehavior(),
+        child: ScrollablePositionedList.builder(
+          key: ValueKey('webtoon-$_chapterIndex'),
+          itemScrollController: _itemScrollController,
+          itemPositionsListener: _itemPositionsListener,
+          initialScrollIndex: clampInt(_restorePage, 0, pages.length - 1),
+          initialAlignment: 0,
+          padding: EdgeInsets.zero,
+          physics: const ClampingScrollPhysics(),
+          itemCount: pages.length + 1, // +1 : l'écran de fin de chapitre
+          itemBuilder: (context, i) {
+            if (i >= pages.length) return _chapterEnd(height * 0.8);
+            return _WebtoonPage(
+              key: ValueKey('page-$i'),
+              page: pages[i],
+              semanticLabel: 'Page ${i + 1} sur ${pages.length}',
+            );
+          },
+        ),
       ),
     );
   }
@@ -580,7 +673,12 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
             textDirection: rtl ? TextDirection.rtl : TextDirection.ltr,
             children: [
               for (final p in spread)
-                Expanded(child: _PageImage(page: pages[p])),
+                Expanded(
+                  child: _PageImage(
+                    page: pages[p],
+                    semanticLabel: 'Page ${p + 1} sur ${pages.length}',
+                  ),
+                ),
             ],
           ),
         );
@@ -632,19 +730,138 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen>
   }
 }
 
+/// Comportement de défilement sans sur-défilement (ni halo ni rebond) : le
+/// contenu ne « remonte » jamais tout seul en haut.
+class _NoGlowScrollBehavior extends ScrollBehavior {
+  const _NoGlowScrollBehavior();
+
+  @override
+  Widget buildOverscrollIndicator(
+    BuildContext context,
+    Widget child,
+    ScrollableDetails details,
+  ) => child;
+
+  @override
+  ScrollPhysics getScrollPhysics(BuildContext context) =>
+      const ClampingScrollPhysics();
+}
+
+/// Une page de webtoon : réserve immédiatement sa hauteur définitive dès que le
+/// ratio de l'image est connu (résolu pendant que la page est encore hors
+/// écran). Résultat : aucune page ne change de taille une fois affichée, donc
+/// plus de saut de défilement quand l'image finit de charger.
+class _WebtoonPage extends ConsumerStatefulWidget {
+  const _WebtoonPage({super.key, required this.page, this.semanticLabel});
+
+  final MangaPage page;
+  final String? semanticLabel;
+
+  @override
+  ConsumerState<_WebtoonPage> createState() => _WebtoonPageState();
+}
+
+class _WebtoonPageState extends ConsumerState<_WebtoonPage> {
+  double? _ratio; // largeur / hauteur
+  ImageStream? _stream;
+  ImageStreamListener? _listener;
+  bool _started = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_started) return;
+    _started = true;
+    _resolveRatio();
+  }
+
+  ImageProvider _provider() {
+    final page = widget.page;
+    final width =
+        (MediaQuery.of(context).size.width *
+                MediaQuery.of(context).devicePixelRatio)
+            .round()
+            .clamp(1, 4096);
+    final local = page.localPath;
+    final ImageProvider base = local != null
+        ? FileImage(File(local))
+        : CachedNetworkImageProvider(
+            page.imageUrl,
+            cacheKey: page.cacheKey,
+            headers: ref.read(urlHeadersProvider)(page.imageUrl),
+          );
+    // On décode à la largeur de l'écran : le ratio est conservé, la mémoire
+    // reste bornée, et le cache d'images est partagé avec l'affichage.
+    return ResizeImage(base, width: width);
+  }
+
+  void _resolveRatio() {
+    final stream = _provider().resolve(createLocalImageConfiguration(context));
+    late final ImageStreamListener listener;
+    listener = ImageStreamListener(
+      (info, _) {
+        stream.removeListener(listener);
+        if (!mounted) return;
+        final w = info.image.width;
+        final h = info.image.height;
+        if (w > 0 && h > 0) setState(() => _ratio = w / h);
+      },
+      onError: (_, _) => stream.removeListener(listener),
+    );
+    stream.addListener(listener);
+    _stream = stream;
+    _listener = listener;
+  }
+
+  @override
+  void dispose() {
+    final stream = _stream;
+    final listener = _listener;
+    if (stream != null && listener != null) stream.removeListener(listener);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final image = _PageImage(
+      page: widget.page,
+      fit: BoxFit.fitWidth,
+      fullWidth: true,
+      semanticLabel: widget.semanticLabel,
+    );
+    final ratio = _ratio;
+    if (ratio == null) {
+      // Hauteur provisoire : le haut de la page reste ancré, seul le bas
+      // s'ajuste — aucun saut visible le temps que l'image se charge.
+      return SizedBox(
+        width: double.infinity,
+        height: MediaQuery.of(context).size.width * 1.4,
+        child: image,
+      );
+    }
+    return AspectRatio(aspectRatio: ratio, child: image);
+  }
+}
+
 /// Une image de page : depuis le disque (chapitre téléchargé) ou depuis internet (avec cache).
+///
+/// Aucun indicateur de chargement (pas de roue) : l'image apparaît en fondu dès
+/// qu'elle est prête. En mode webtoon, une hauteur est réservée pour éviter que
+/// le contenu ne « saute » pendant le chargement.
 class _PageImage extends ConsumerStatefulWidget {
   const _PageImage({
     required this.page,
     this.fit = BoxFit.contain,
-    this.placeholderHeight,
+    this.fullWidth = false,
+    this.semanticLabel,
   });
 
   final MangaPage page;
   final BoxFit fit;
+  final String? semanticLabel;
 
-  /// Défini en mode webtoon : hauteur réservée pendant le chargement.
-  final double? placeholderHeight;
+  /// Vrai en mode webtoon : l'image occupe toute la largeur.
+  final bool fullWidth;
 
   @override
   ConsumerState<_PageImage> createState() => _PageImageState();
@@ -653,19 +870,14 @@ class _PageImage extends ConsumerStatefulWidget {
 class _PageImageState extends ConsumerState<_PageImage> {
   int _attempt = 0;
 
-  Widget _boxed(Widget child) {
-    final height = widget.placeholderHeight;
-    return height == null
-        ? Center(child: child)
-        : SizedBox(
-            height: height,
-            child: Center(child: child),
-          );
+  Widget _placeholder() {
+    if (!widget.fullWidth) return const SizedBox.shrink();
+    return const SizedBox(width: double.infinity, height: 300);
   }
 
   Widget _errorWidget() {
-    return _boxed(
-      Column(
+    return Center(
+      child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           const Icon(
@@ -695,7 +907,7 @@ class _PageImageState extends ConsumerState<_PageImage> {
   @override
   Widget build(BuildContext context) {
     final page = widget.page;
-    final fullWidth = widget.placeholderHeight != null;
+    final fullWidth = widget.fullWidth;
     final local = page.localPath;
     // Décoder à la largeur de l'écran : les pages (surtout les webtoons très
     // hauts) ne sont plus décodées à leur taille native, ce qui allège
@@ -705,28 +917,37 @@ class _PageImageState extends ConsumerState<_PageImage> {
                 MediaQuery.of(context).devicePixelRatio)
             .round()
             .clamp(1, 4096);
+    final Widget image;
     if (local != null) {
-      return Image.file(
+      image = Image.file(
         File(local),
         width: fullWidth ? double.infinity : null,
         fit: widget.fit,
         cacheWidth: cacheWidth,
+        gaplessPlayback: true,
+        frameBuilder: (context, child, frame, wasSync) {
+          if (wasSync || frame != null) return child;
+          return _placeholder();
+        },
         errorBuilder: (_, _, _) => _errorWidget(),
       );
+    } else {
+      image = CachedNetworkImage(
+        key: ValueKey('${page.imageUrl}#$_attempt'),
+        imageUrl: page.imageUrl,
+        cacheKey: page.cacheKey,
+        httpHeaders: ref.watch(urlHeadersProvider)(page.imageUrl),
+        width: fullWidth ? double.infinity : null,
+        fit: widget.fit,
+        memCacheWidth: cacheWidth,
+        fadeInDuration: const Duration(milliseconds: 120),
+        fadeOutDuration: Duration.zero,
+        placeholder: (context, url) => _placeholder(),
+        errorWidget: (context, url, error) => _errorWidget(),
+      );
     }
-    return CachedNetworkImage(
-      key: ValueKey('${page.imageUrl}#$_attempt'),
-      imageUrl: page.imageUrl,
-      cacheKey: page.cacheKey,
-      httpHeaders: ref.watch(urlHeadersProvider)(page.imageUrl),
-      width: fullWidth ? double.infinity : null,
-      fit: widget.fit,
-      memCacheWidth: cacheWidth,
-      fadeInDuration: Duration.zero,
-      fadeOutDuration: Duration.zero,
-      progressIndicatorBuilder: (context, url, progress) =>
-          _boxed(CircularProgressIndicator(value: progress.progress)),
-      errorWidget: (context, url, error) => _errorWidget(),
-    );
+    final label = widget.semanticLabel;
+    if (label == null) return image;
+    return Semantics(image: true, label: label, child: image);
   }
 }

@@ -49,17 +49,29 @@ class CatalogState {
 class CatalogNotifier extends Notifier<CatalogState> {
   int _token = 0;
   String _language = '';
+  String _localRoot = '';
 
   @override
   CatalogState build() => const CatalogState();
 
-  /// Ouvre le catalogue d'une source (repart de zéro si la source ou la langue change).
+  /// Ouvre le catalogue d'une source. Il repart de zéro si la source, la langue
+  /// ou le dossier de la bibliothèque locale ont changé depuis le dernier appel.
   void start(String sourceId) {
     final language = ref.read(settingsProvider).contentLanguage;
-    final same = state.sourceId == sourceId && language == _language;
+    final localRoot = ref.read(settingsProvider).localRoot;
+    final same = state.sourceId == sourceId &&
+        language == _language &&
+        localRoot == _localRoot;
     if (same && (state.items.isNotEmpty || state.loading)) return;
     _language = language;
+    _localRoot = localRoot;
     state = CatalogState(sourceId: sourceId);
+    _loadFirstPage();
+  }
+
+  /// Recharge immédiatement le catalogue affiché (changement de dossier local).
+  void refresh() {
+    if (state.sourceId.isEmpty) return;
     _loadFirstPage();
   }
 

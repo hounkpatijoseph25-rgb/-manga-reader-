@@ -1,5 +1,6 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../core/notifications.dart';
 import '../../core/providers.dart';
 
 /// Résultat d'une mise à jour de la bibliothèque.
@@ -118,6 +119,9 @@ class LibraryUpdater extends Notifier<LibraryUpdateState> {
       titles: titles,
     );
     state = LibraryUpdateState(report: report);
+    if (added > 0 && ref.read(settingsProvider).notificationsEnabled) {
+      await NotificationService.showNewChapters(count: added, titles: titles);
+    }
     return report;
   }
 }

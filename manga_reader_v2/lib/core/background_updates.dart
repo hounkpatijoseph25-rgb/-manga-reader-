@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:ui';
 
 import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -7,6 +8,7 @@ import 'package:workmanager/workmanager.dart';
 import '../data/repositories/settings_repository.dart';
 import '../data/storage/storage_service.dart';
 import '../features/library/library_updater.dart';
+import 'notifications.dart';
 import 'providers.dart';
 import 'utils/crash_guard.dart';
 
@@ -29,9 +31,13 @@ bool get _supported => Platform.isAndroid || Platform.isIOS;
 void updatesCallbackDispatcher() {
   Workmanager().executeTask((task, inputData) async {
     WidgetsFlutterBinding.ensureInitialized();
+    // Isolate séparé : les plugins (dont les notifications) doivent y être
+    // enregistrés avant tout appel.
+    DartPluginRegistrant.ensureInitialized();
     ProviderContainer? container;
     try {
       final storage = await StorageService.init();
+      await NotificationService.init();
       container = ProviderContainer(
         overrides: [storageProvider.overrideWithValue(storage)],
       );

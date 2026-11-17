@@ -13,13 +13,26 @@ import '../../core/theme/app_theme.dart';
 /// Les en-têtes nécessaires (Referer du CDN) sont joints via
 /// `urlHeadersProvider`.
 class CoverImage extends ConsumerWidget {
-  const CoverImage({super.key, required this.url, this.fit = BoxFit.cover});
+  const CoverImage({
+    super.key,
+    required this.url,
+    this.fit = BoxFit.cover,
+    this.semanticLabel,
+  });
 
   final String? url;
   final BoxFit fit;
+  final String? semanticLabel;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final image = _resolve(context, ref);
+    final label = semanticLabel;
+    if (label == null) return ExcludeSemantics(child: image);
+    return Semantics(image: true, label: label, child: image);
+  }
+
+  Widget _resolve(BuildContext context, WidgetRef ref) {
     final address = url;
     if (address == null || address.isEmpty) {
       return const _CoverPlaceholder(icon: Icons.menu_book_outlined);

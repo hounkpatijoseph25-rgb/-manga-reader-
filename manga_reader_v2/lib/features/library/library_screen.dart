@@ -10,6 +10,7 @@ import '../../shared/widgets/cover_image.dart';
 import '../../shared/widgets/manga_card.dart';
 import '../../shared/widgets/state_views.dart';
 import '../details/details_screen.dart';
+import '../stats/stats_screen.dart';
 import 'library_updater.dart';
 import 'updates_screen.dart';
 
@@ -150,10 +151,12 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen> {
                   ref.read(settingsProvider.notifier).setLibraryGrid(!grid),
             ),
             PopupMenuButton<String>(
+              tooltip: 'Plus d\'options',
               onSelected: (value) {
                 if (value == 'refresh') _refresh();
                 if (value == 'categories') _manageCategories();
                 if (value == 'updates') _openUpdates();
+                if (value == 'stats') _openStats();
               },
               itemBuilder: (_) => const [
                 PopupMenuItem(
@@ -167,6 +170,10 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen> {
                 PopupMenuItem(
                   value: 'categories',
                   child: Text('Gérer les catégories'),
+                ),
+                PopupMenuItem(
+                  value: 'stats',
+                  child: Text('Statistiques'),
                 ),
               ],
             ),
@@ -184,7 +191,15 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen> {
             : TabBarView(
                 children: [
                   for (var i = 0; i < tabCount; i++)
-                    _tab(i, categories, entries, progress, grid),
+                    // `Builder` : le filtrage de chaque onglet (catégorie) n'est
+                    // exécuté que lorsqu'il est réellement affiché, au lieu de
+                    // l'être pour TOUS les onglets à chaque reconstruction de
+                    // la bibliothèque (qui a lieu à chaque changement de
+                    // progression de lecture).
+                    Builder(
+                      builder: (_) =>
+                          _tab(i, categories, entries, progress, grid),
+                    ),
                 ],
               ),
       ),
@@ -442,6 +457,12 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen> {
     );
     if (!mounted) return;
     ref.invalidate(pendingUpdatesProvider);
+  }
+
+  Future<void> _openStats() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => const StatsScreen()),
+    );
   }
 }
 

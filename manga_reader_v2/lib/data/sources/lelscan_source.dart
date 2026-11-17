@@ -125,8 +125,10 @@ class LelscanSource extends MangaSource {
     final html = await _detailHtml(manga.id);
     final chapters = <Chapter>[];
     final seen = <String>{};
+    // Le site liste la plupart des chapitres dans un <select> (value="…/scan-<slug>/<n>")
+    // et seulement les derniers en liens <a href>. On accepte les deux.
     final matches = RegExp(
-      r'href="(https://lelscan\.net/scan-' +
+      r'(?:href|value)="(https://lelscan\.net/scan-' +
           RegExp.escape(manga.id) +
           r'/(\d+(?:[.,]\d+)?))"',
     ).allMatches(html);
@@ -159,9 +161,11 @@ class LelscanSource extends MangaSource {
     // La première page contient la liste déroulante des pages du chapitre.
     final html = await _get('${chapter.id}/1');
     var pages = 1;
-    for (final match in RegExp(r'<option value="[^"]*/(\d+)"').allMatches(
-      html,
-    )) {
+    // Le lecteur contient aussi un menu déroulant des chapitres : on ne garde
+    // que les options qui pointent vers une PAGE de CE chapitre (…/<n>/<page>).
+    for (final match in RegExp(
+      '<option value="[^"]*/${RegExp.escape(number)}/(\\d+)"',
+    ).allMatches(html)) {
       final value = int.tryParse(match[1]!);
       if (value != null && value > pages) pages = value;
     }

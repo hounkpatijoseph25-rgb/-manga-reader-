@@ -11,27 +11,39 @@ class MangaDexSource extends MangaSource {
     this._dio, {
     required this._language,
     required this._dataSaver,
+    this._id = 'mangadex',
+    this._name = 'MangaDex',
+    this._description =
+        "Catalogue communautaire via l'API publique de MangaDex",
+    this._adult = false,
+    this._ratings = const ['safe', 'suggestive'],
   });
 
   final Dio _dio;
   final String Function() _language;
   final bool Function() _dataSaver;
+  final String _id;
+  final String _name;
+  final String _description;
+  final bool _adult;
+  final List<String> _ratings;
 
   static const _host = 'api.mangadex.org';
   static const _pageSize = 20;
-  static const _ratings = ['safe', 'suggestive'];
 
   List<Genre>? _genres;
 
   @override
-  String get id => 'mangadex';
+  String get id => _id;
 
   @override
-  String get name => 'MangaDex';
+  String get name => _name;
 
   @override
-  String get description =>
-      "Catalogue communautaire via l'API publique de MangaDex";
+  String get description => _description;
+
+  @override
+  bool get isAdult => _adult;
 
   // ---------------------------------------------------------------- catalogue
 
@@ -89,18 +101,31 @@ class MangaDexSource extends MangaSource {
 
   @override
   Future<List<Chapter>> fetchChapters(Manga manga) async {
+    final preferred = await _fetchChapters(manga, _language());
+    if (preferred.isNotEmpty) return preferred;
+    // MangaDex annonce parfois une langue comme disponible alors qu'aucun
+    // chapitre n'existe réellement : on retombe sur l'anglais, puis sur toutes
+    // les langues, pour ne jamais afficher une fiche vide.
+    final english = await _fetchChapters(manga, 'en');
+    if (english.isNotEmpty) return english;
+    return _fetchChapters(manga, null);
+  }
+
+  /// Chapitres du manga filtrés par [language] (`null` = toutes les langues).
+  Future<List<Chapter>> _fetchChapters(Manga manga, String? language) async {
     const limit = 500;
     final all = <Chapter>[];
     var offset = 0;
     while (true) {
-      final uri = Uri.https(_host, '/manga/${manga.id}/feed', {
+      final params = <String, dynamic>{
         'limit': '$limit',
         'offset': '$offset',
-        'translatedLanguage[]': [_language()],
         'includes[]': ['scanlation_group'],
         'includeExternalUrl': '0',
         'order[chapter]': 'asc',
-      });
+      };
+      if (language != null) params['translatedLanguage[]'] = [language];
+      final uri = Uri.https(_host, '/manga/${manga.id}/feed', params);
       final res = await _dio.getUri<Map<String, dynamic>>(uri);
       final body = res.data ?? const <String, dynamic>{};
       final list = ((body['data'] as List?) ?? const []).whereType<Map>();
@@ -118,9 +143,8 @@ class MangaDexSource extends MangaSource {
       if (c.pageCount <= 0) continue;
       byNumber.putIfAbsent(c.number ?? c.id, () => c);
     }
-    final result = byNumber.values.toList()
+    return byNumber.values.toList()
       ..sort((a, b) => a.numberValue.compareTo(b.numberValue));
-    return result;
   }
 
   @override

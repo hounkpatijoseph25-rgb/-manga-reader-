@@ -27,13 +27,21 @@ import 'manga_source.dart';
 /// Les traitements lourds (parcours du disque) sont faits dans un isolate :
 /// l'interface ne se fige jamais, même avec une grosse collection.
 class LocalMangaSource extends MangaSource {
-  LocalMangaSource({required this.rootPath, this.coverOverride});
+  LocalMangaSource({
+    required this.rootPath,
+    this.coverOverride,
+    this.downloadsRoot,
+  });
 
   /// Renvoie le dossier choisi par l'utilisateur (chaîne vide = aucun).
   final String? Function() rootPath;
 
   /// Couverture choisie à la main par l'utilisateur : `dossier manga → image`.
   final String? Function(String mangaPath)? coverOverride;
+
+  /// Dossier des téléchargements de l'application, scanné en plus du dossier
+  /// choisi : les chapitres téléchargés apparaissent donc aussi ici.
+  final String? Function()? downloadsRoot;
 
   List<List<String>>? _cache;
   String? _cacheRoot;
@@ -48,12 +56,13 @@ class LocalMangaSource extends MangaSource {
   @override
   String get description {
     final root = _root;
-    if (root == null) return 'Aucun dossier importé';
+    if (root == null) return 'Téléchargements de l\'application';
     if (!Directory(root).existsSync()) return 'Dossier introuvable : $root';
     if (!_readable(Directory(root))) {
       return 'Dossier illisible — autorise « Accès à tous les fichiers » '
           'dans les réglages Android';
     }
+    if (_scanRoots().length > 1) return '$root · téléchargements inclus';
     return root;
   }
 
@@ -64,6 +73,21 @@ class LocalMangaSource extends MangaSource {
     final path = rootPath();
     if (path == null || path.trim().isEmpty) return null;
     return path;
+  }
+
+  /// Dossiers à parcourir : celui choisi par l'utilisateur, puis celui des
+  /// téléchargements de l'application (sans doublon).
+  List<String> _scanRoots() {
+    final roots = <String>[];
+    final main = _root;
+    if (main != null) roots.add(main);
+    final extra = downloadsRoot?.call();
+    if (extra != null &&
+        extra.trim().isNotEmpty &&
+        !roots.any((r) => p.equals(r, extra))) {
+      roots.add(extra);
+    }
+    return roots;
   }
 
   // --------------------------------------------------------------- couverture
@@ -108,14 +132,13 @@ class LocalMangaSource extends MangaSource {
     required int page,
     required CatalogQuery query,
   }) async {
-    final root = _root;
-    if (root == null) return const MangaPageResult([], false);
-    final rootDir = Directory(root);
-    if (!rootDir.existsSync() || !_readable(rootDir)) {
-      return const MangaPageResult([], false);
-    }
+    final roots = [
+      for (final path in _scanRoots())
+        if (Directory(path).existsSync() && _readable(Directory(path))) path,
+    ];
+    if (roots.isEmpty) return const MangaPageResult([], false);
 
-    final rows = await _discovered(rootDir);
+    final rows = await _discovered(roots);
     final text = query.text.trim().toLowerCase();
 
     final mangas = <Manga>[];
@@ -149,18 +172,19 @@ class LocalMangaSource extends MangaSource {
 
   /// Découverte des mangas, mise en cache quelques minutes (le parcours du
   /// disque est coûteux) et exécutée hors du thread principal.
-  Future<List<List<String>>> _discovered(Directory root) async {
+  Future<List<List<String>>> _discovered(List<String> roots) async {
+    final cacheKey = roots.join('|');
     final cached = _cache;
     final time = _cacheTime;
     if (cached != null &&
-        _cacheRoot == root.path &&
+        _cacheRoot == cacheKey &&
         time != null &&
         DateTime.now().difference(time) < const Duration(minutes: 2)) {
       return cached;
     }
-    final rows = await compute(_discoverTask, root.path);
+    final rows = await compute(_discoverTask, roots);
     _cache = rows;
-    _cacheRoot = root.path;
+    _cacheRoot = cacheKey;
     _cacheTime = DateTime.now();
     return rows;
   }
@@ -192,17 +216,21 @@ class LocalMangaSource extends MangaSource {
     if (!dir.existsSync()) return const [];
 
     final rows = await compute(_collectTask, [dir.path, dir.path]);
-    return [
-      for (var i = 0; i < rows.length; i++)
+    final chapters = <Chapter>[];
+    for (var i = 0; i < rows.length; i++) {
+      final number = _chapterNumber(rows[i][1]) ?? '${i + 1}';
+      chapters.add(
         Chapter(
           id: rows[i][0],
           mangaId: manga.id,
           sourceId: id,
-          number: _chapterNumber(rows[i][1]) ?? '${i + 1}',
-          title: rows[i][1],
+          number: number,
+          title: _chapterTitle(rows[i][1], number),
           pageCount: int.tryParse(rows[i][2]) ?? 0,
         ),
-    ];
+      );
+    }
+    return chapters;
   }
 
   @override
@@ -420,14 +448,21 @@ void _walkMangas(Directory dir, int depth, List<Directory> out) {
   }
 }
 
-/// Entrée de l'isolate de découverte : renvoie `[chemin, titre, couverture]`.
-List<List<String>> _discoverTask(String rootPath) {
+/// Entrée de l'isolate de découverte : renvoie `[chemin, titre, couverture]`
+/// pour chaque manga trouvé dans les racines fournies (sans doublon).
+List<List<String>> _discoverTask(List<String> roots) {
   final found = <Directory>[];
-  _walkMangas(Directory(rootPath), 0, found);
+  for (final root in roots) {
+    _walkMangas(Directory(root), 0, found);
+  }
   found.sort((a, b) => _naturalCompare(p.basename(a.path), p.basename(b.path)));
-  return [
-    for (final dir in found) [dir.path, p.basename(dir.path), _coverFor(dir) ?? ''],
-  ];
+  final seen = <String>{};
+  final result = <List<String>>[];
+  for (final dir in found) {
+    if (!seen.add(dir.path)) continue;
+    result.add([dir.path, p.basename(dir.path), _coverFor(dir) ?? '']);
+  }
+  return result;
 }
 
 String? _coverFor(Directory dir) {
@@ -524,6 +559,29 @@ String? _chapterNumber(String relative) {
   final match = RegExp(r'(\d+(?:[.,]\d+)?)').firstMatch(name);
   if (match == null) return null;
   return match.group(1)!.replaceAll(',', '.');
+}
+
+/// Titre affiché d'un chapitre, sans répéter le numéro déjà montré à côté :
+/// « Chapitre 5 » → vide, « Chapitre 5 - Le début » → « Le début ».
+String _chapterTitle(String relative, String number) {
+  final dir = p.dirname(relative);
+  final name = p.basename(relative);
+  final match = RegExp(
+    '^\\s*(?:chapitre|chap|ch)\\s*\\.?\\s*${RegExp.escape(number)}\\b'
+    '\\s*[-–—:.]?\\s*',
+    caseSensitive: false,
+  ).firstMatch(name);
+  final String? title;
+  if (match != null) {
+    // Le numéro était écrit dans le nom : on garde ce qui le suit, s'il reste
+    // quelque chose d'utile.
+    final rest = name.substring(match.end).trim();
+    title = (rest.isEmpty || rest == number) ? null : rest;
+  } else {
+    title = name == number ? null : name;
+  }
+  if (title == null) return p.equals(dir, '.') ? '' : dir;
+  return p.equals(dir, '.') ? title : p.join(dir, title);
 }
 
 int _archivePageCount(String filePath) {

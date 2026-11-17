@@ -25,3 +25,11 @@ _ide_helper.php
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+# APK : on ne versionne que celui listé juste après (les autres sont ignorés).
+*.apk
+!manga_reader_v2-1.2.0-release.apk
+
+# État interne des outils et journaux de build.
+/.omo
+/build_err*.txt

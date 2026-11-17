@@ -15,6 +15,7 @@ class StorageService {
     required this.categoriesBox,
     required this.settingsBox,
     required this.downloadsBox,
+    required this.downloadQueueBox,
     required this.chapterCacheBox,
     required this.updatesBox,
   });
@@ -28,6 +29,9 @@ class StorageService {
 
   /// Métadonnées des chapitres téléchargés (lecture hors connexion).
   final Box<String> downloadsBox;
+
+  /// File d'attente des téléchargements (reprise après fermeture/redémarrage).
+  final Box<String> downloadQueueBox;
 
   /// Dernière liste de chapitres connue, par manga (secours hors connexion).
   final Box<String> chapterCacheBox;
@@ -45,6 +49,7 @@ class StorageService {
       categoriesBox: await Hive.openBox<String>('categories'),
       settingsBox: await Hive.openBox<dynamic>('settings'),
       downloadsBox: await Hive.openBox<String>('downloads'),
+      downloadQueueBox: await Hive.openBox<String>('download_queue'),
       chapterCacheBox: await Hive.openBox<String>('chapter_cache'),
       updatesBox: await Hive.openBox<String>('updates'),
     );

@@ -18,20 +18,44 @@ class BackgroundDownloads {
   static bool _ready = false;
   static bool _running = false;
 
+  /// Sérialise `start`/`stop` : un arrêt demandé juste après un démarrage ne
+  /// doit pas laisser le service tourner, et inversement.
+  static Future<void> _lifecycle = Future<void>.value();
+
   static bool get supported => Platform.isAndroid || Platform.isIOS;
 
+  static Future<void> _serialized(Future<void> Function() action) {
+    final next = _lifecycle.then((_) => action());
+    _lifecycle = next.then<void>(
+      (_) {},
+      onError: (Object error, StackTrace stack) {},
+    );
+    return next;
+  }
+
   /// Démarre le service (ou met à jour sa notification s'il tourne déjà).
-  static Future<void> start({required String text}) async {
-    if (!supported) return;
+  static Future<void> start({
+    required String text,
+    String title = 'Téléchargements',
+  }) {
+    if (!supported) return Future<void>.value();
     _init();
+    return _serialized(() => _startNow(text: text, title: title));
+  }
+
+  static Future<void> _startNow({
+    required String text,
+    required String title,
+  }) async {
     try {
       if (!_running) {
         if (!await FlutterForegroundTask.isRunningService) {
           await _requestNotificationPermission();
+          await _requestBatteryOptimizationExemption();
           final result = await FlutterForegroundTask.startService(
             serviceId: _notificationId,
             serviceTypes: const [ForegroundServiceTypes.dataSync],
-            notificationTitle: 'Téléchargements',
+            notificationTitle: title,
             notificationText: text,
             callback: backgroundDownloadsCallback,
           );
@@ -42,33 +66,48 @@ class BackgroundDownloads {
         }
         _running = true;
       }
-      await FlutterForegroundTask.updateService(notificationText: text);
+      await FlutterForegroundTask.updateService(
+        notificationTitle: title,
+        notificationText: text,
+      );
     } catch (error) {
       debugPrint('Service de téléchargement indisponible : $error');
     }
   }
 
   /// Met à jour la progression affichée dans la notification.
-  static Future<void> update(String text) async {
+  static Future<void> update({
+    required String text,
+    String? title,
+  }) async {
     if (!supported || !_running) return;
     try {
-      await FlutterForegroundTask.updateService(notificationText: text);
+      await FlutterForegroundTask.updateService(
+        notificationTitle: title,
+        notificationText: text,
+      );
     } catch (error) {
       debugPrint('Mise à jour de la notification impossible : $error');
     }
   }
 
   /// Arrête le service une fois la file vidée.
-  static Future<void> stop() async {
-    if (!supported) return;
-    _running = false;
-    try {
-      if (await FlutterForegroundTask.isRunningService) {
-        await FlutterForegroundTask.stopService();
+  ///
+  /// [shouldStop] est réévalué au moment où l'arrêt s'exécute : si un nouveau
+  /// téléchargement a été ajouté entre-temps, le service reste en vie.
+  static Future<void> stop({bool Function()? shouldStop}) {
+    if (!supported) return Future<void>.value();
+    return _serialized(() async {
+      if (shouldStop != null && !shouldStop()) return;
+      _running = false;
+      try {
+        if (await FlutterForegroundTask.isRunningService) {
+          await FlutterForegroundTask.stopService();
+        }
+      } catch (error) {
+        debugPrint('Arrêt du service de téléchargement impossible : $error');
       }
-    } catch (error) {
-      debugPrint('Arrêt du service de téléchargement impossible : $error');
-    }
+    });
   }
 
   static void _init() {
@@ -115,6 +154,24 @@ class BackgroundDownloads {
     } catch (error) {
       // Refus ou absence d'activité : le service peut quand même tourner.
       debugPrint('Permission de notification : $error');
+    }
+  }
+
+  /// Demande une seule fois à Android d'exempter l'application de
+  /// l'optimisation de batterie : sans cela, certains constructeurs tuent le
+  /// service dès que l'écran est verrouillé.
+  static Future<void> _requestBatteryOptimizationExemption() async {
+    if (!Platform.isAndroid) return;
+    try {
+      if (await FlutterForegroundTask.isIgnoringBatteryOptimizations) return;
+      final asked =
+          await FlutterForegroundTask.getData<bool>(key: 'battery-asked') ??
+          false;
+      if (asked) return;
+      await FlutterForegroundTask.saveData(key: 'battery-asked', value: true);
+      await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+    } catch (error) {
+      debugPrint('Exemption batterie : $error');
     }
   }
 }

@@ -6,8 +6,10 @@ import '../browse/sources_screen.dart';
 import '../history/history_screen.dart';
 import '../library/library_screen.dart';
 import '../settings/settings_screen.dart';
+import '../upcoming/upcoming_screen.dart';
 
-/// Barre de navigation du bas : Bibliothèque / Historique / Explorer / Réglages.
+/// Barre de navigation du bas : Bibliothèque / À venir / Historique /
+/// Explorer / Réglages.
 class HomeShell extends ConsumerStatefulWidget {
   const HomeShell({super.key});
 
@@ -18,8 +20,17 @@ class HomeShell extends ConsumerStatefulWidget {
 class _HomeShellState extends ConsumerState<HomeShell> {
   int _index = 0;
 
+  /// Onglets déjà affichés au moins une fois.
+  ///
+  /// `IndexedStack` construit tous ses enfants dès le démarrage : l'onglet
+  /// « À venir » parcourait donc tout le cache de chapitres de la bibliothèque
+  /// avant même le premier affichage. On ne construit un écran qu'à sa première
+  /// visite (l'état reste ensuite conservé).
+  final Set<int> _built = <int>{0};
+
   static const _pages = <Widget>[
     LibraryScreen(),
+    UpcomingScreen(),
     HistoryScreen(),
     SourcesScreen(),
     SettingsScreen(),
@@ -37,15 +48,29 @@ class _HomeShellState extends ConsumerState<HomeShell> {
     );
 
     return Scaffold(
-      body: IndexedStack(index: _index, children: _pages),
+      body: IndexedStack(
+        index: _index,
+        children: [
+          for (var i = 0; i < _pages.length; i++)
+            _built.contains(i) ? _pages[i] : const SizedBox.shrink(),
+        ],
+      ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _index,
-        onDestinationSelected: (i) => setState(() => _index = i),
+        onDestinationSelected: (i) => setState(() {
+          _built.add(i);
+          _index = i;
+        }),
         destinations: [
           NavigationDestination(
             icon: libraryIcon(Icons.collections_bookmark_outlined),
             selectedIcon: libraryIcon(Icons.collections_bookmark),
             label: 'Bibliothèque',
+          ),
+          const NavigationDestination(
+            icon: Icon(Icons.calendar_month_outlined),
+            selectedIcon: Icon(Icons.calendar_month),
+            label: 'À venir',
           ),
           const NavigationDestination(
             icon: Icon(Icons.history),

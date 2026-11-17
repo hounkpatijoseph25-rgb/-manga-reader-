@@ -28,6 +28,12 @@ class ChapterCacheRepository {
     }
   }
 
+  /// Contenu JSON brut, sans décodage.
+  ///
+  /// Permet de rassembler plusieurs entrées puis de les décoder hors du thread
+  /// principal (voir `compute` dans `upcoming_providers.dart`).
+  String? raw(String mangaKey) => _box.get(mangaKey);
+
   Future<void> save(String mangaKey, List<Chapter> chapters) {
     return _box.put(
       mangaKey,

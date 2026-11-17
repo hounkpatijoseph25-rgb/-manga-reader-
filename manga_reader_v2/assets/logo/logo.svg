@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Logo « Manga Reader » — source de design.
+
+  Mark : deux pages superposées (manga ouvert) posées sur un fond sombre.
+  La page avant porte un découpage en cases (1 bandeau + 2 cases), la case
+  du bas à droite est mise en avant en orange : la « case qu'on lit ».
+
+  Ce fichier est la référence visuelle : les PNG (icône Android, splash,
+  logo affiché dans l'application) sont générés par tool/make_icons.ps1.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512"
+     viewBox="0 0 108 108" role="img" aria-label="Manga Reader">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1B1E27"/>
+      <stop offset="1" stop-color="#0B0C10"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF9A5A"/>
+      <stop offset="1" stop-color="#FF6B35"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Fond sombre arrondi (squircle) -->
+  <rect width="108" height="108" rx="24" fill="url(#bg)"/>
+
+  <!-- Page arrière, légèrement inclinée -->
+  <rect x="-18.8" y="-24.45" width="37.6" height="48.9" rx="5.6"
+        fill="#FFFFFF" fill-opacity="0.35"
+        transform="translate(48.4 55.3) rotate(-9)"/>
+
+  <!-- Page avant + découpage en cases -->
+  <g transform="translate(57.1 54) rotate(7)">
+    <rect x="-18.8" y="-24.45" width="37.6" height="48.9" rx="5.6" fill="#FFFFFF"/>
+    <rect x="-14.7" y="-20.35" width="29.4" height="19.6" rx="1.8" fill="#14161C"/>
+    <rect x="-14.7" y="1.85" width="13.4" height="18.4" rx="1.8" fill="#14161C"/>
+    <rect x="1.3" y="1.85" width="13.4" height="18.4" rx="1.8" fill="url(#accent)"/>
+  </g>
+</svg>

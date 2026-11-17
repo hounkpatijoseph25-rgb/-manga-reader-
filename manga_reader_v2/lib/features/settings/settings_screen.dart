@@ -1,13 +1,17 @@
+import 'dart:convert';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/background_updates.dart';
 import '../../core/constants.dart';
+import '../../core/notifications.dart';
 import '../../core/providers.dart';
 import '../../core/theme/app_theme.dart';
-import '../../core/utils/format.dart';
 import '../../core/utils/files.dart';
+import '../../core/utils/format.dart';
 import '../../data/repositories/settings_repository.dart';
 import '../../shared/widgets/choice_sheet.dart';
 import '../browse/local_library.dart';
@@ -114,6 +118,23 @@ class SettingsScreen extends ConsumerWidget {
             value: settings.dataSaver,
             onChanged: notifier.setDataSaver,
           ),
+          SwitchListTile(
+            secondary: const Icon(Icons.screen_lock_portrait_outlined),
+            title: const Text("Garder l'écran allumé"),
+            subtitle: const Text("Pendant la lecture d'un chapitre"),
+            value: settings.keepScreenOn,
+            onChanged: notifier.setKeepScreenOn,
+          ),
+          ListTile(
+            leading: const Icon(Icons.brightness_6_outlined),
+            title: const Text('Luminosité du lecteur'),
+            subtitle: Text(
+              settings.readerBrightness < 0
+                  ? 'Luminosité du système'
+                  : '${(settings.readerBrightness * 100).round()} %',
+            ),
+            onTap: () => _pickBrightness(context, ref),
+          ),
 
           // --------------------------------------------------------- Contenu
           const _SectionTitle('Contenu'),
@@ -164,6 +185,18 @@ class SettingsScreen extends ConsumerWidget {
               }
               notifier.setUpdatesIntervalHours(picked);
               await applyUpdatesSchedule(picked);
+            },
+          ),
+          SwitchListTile(
+            secondary: const Icon(Icons.notifications_outlined),
+            title: const Text('Notifications de nouveaux chapitres'),
+            subtitle: const Text(
+              'Prévenir quand la veille découvre des nouveautés',
+            ),
+            value: settings.notificationsEnabled,
+            onChanged: (value) async {
+              notifier.setNotificationsEnabled(value);
+              if (value) await NotificationService.requestPermission();
             },
           ),
           ListTile(
@@ -259,9 +292,26 @@ class SettingsScreen extends ConsumerWidget {
                 : IconButton(
                     icon: const Icon(Icons.close),
                     tooltip: 'Retirer ce dossier',
-                    onPressed: () => notifier.setLocalRoot(''),
+                    onPressed: () => forgetLocalRoot(context, ref),
                   ),
             onTap: () => _pickLocalFolder(context, ref),
+          ),
+
+          // ------------------------------------------ Sauvegarde et restauration
+          const _SectionTitle('Sauvegarde et restauration'),
+          ListTile(
+            leading: const Icon(Icons.save_alt),
+            title: const Text('Exporter la sauvegarde'),
+            subtitle: const Text(
+              'Bibliothèque, progression, historique et réglages',
+            ),
+            onTap: () => _exportBackup(context, ref),
+          ),
+          ListTile(
+            leading: const Icon(Icons.restore),
+            title: const Text('Importer une sauvegarde'),
+            subtitle: const Text('Remplace les données actuelles'),
+            onTap: () => _importBackup(context, ref),
           ),
 
           // ---------------------------------------------------------- À propos
@@ -362,6 +412,130 @@ class SettingsScreen extends ConsumerWidget {
       ..showSnackBar(
         const SnackBar(content: Text("Dossier interne de l'application")),
       );
+  }
+
+  /// Choisit la luminosité appliquée par le lecteur (`-1` = système).
+  Future<void> _pickBrightness(BuildContext context, WidgetRef ref) async {
+    final notifier = ref.read(settingsProvider.notifier);
+    var value = ref.read(settingsProvider).readerBrightness;
+    final chosen = await showDialog<double>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setLocal) => AlertDialog(
+          title: const Text('Luminosité du lecteur'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Slider(
+                value: value < 0 ? 0.5 : value,
+                onChanged: (v) => setLocal(() => value = v),
+              ),
+              Text(
+                value < 0
+                    ? 'Luminosité du système'
+                    : '${(value * 100).round()} %',
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(-1.0),
+              child: const Text('Système'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.of(context).pop(value < 0 ? 0.5 : value),
+              child: const Text('Valider'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (chosen != null) notifier.setReaderBrightness(chosen);
+  }
+
+  /// Enregistre la base locale dans un fichier JSON choisi par l'utilisateur.
+  Future<void> _exportBackup(BuildContext context, WidgetRef ref) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final json = ref.read(backupServiceProvider).encode();
+    final stamp = DateTime.now().toIso8601String().substring(0, 10);
+    String? path;
+    try {
+      path = await FilePicker.platform.saveFile(
+        dialogTitle: 'Enregistrer la sauvegarde',
+        fileName: 'manga_reader_sauvegarde_$stamp.json',
+        bytes: utf8.encode(json),
+      );
+    } catch (_) {
+      path = null;
+    }
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(
+            path == null ? 'Export annulé' : 'Sauvegarde enregistrée',
+          ),
+        ),
+      );
+  }
+
+  /// Restaure la base locale depuis un fichier JSON choisi par l'utilisateur.
+  Future<void> _importBackup(BuildContext context, WidgetRef ref) async {
+    final messenger = ScaffoldMessenger.of(context);
+    FilePickerResult? result;
+    try {
+      result = await FilePicker.platform.pickFiles(
+        dialogTitle: 'Choisir une sauvegarde',
+        withData: true,
+      );
+    } catch (_) {
+      result = null;
+    }
+    if (result == null || result.files.isEmpty) return;
+    final bytes = result.files.single.bytes;
+    if (bytes == null) {
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(const SnackBar(content: Text('Fichier illisible')));
+      return;
+    }
+    if (!context.mounted) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Restaurer la sauvegarde ?'),
+        content: const Text(
+          'La bibliothèque, la progression, l\'historique et les réglages '
+          'actuels seront remplacés par le contenu du fichier.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Annuler'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Restaurer'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      final decoded = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
+      await ref.read(backupServiceProvider).restore(decoded);
+      ref.invalidate(settingsProvider);
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(const SnackBar(content: Text('Sauvegarde restaurée')));
+    } catch (_) {
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          const SnackBar(content: Text('Sauvegarde invalide ou illisible')),
+        );
+    }
   }
 }
 

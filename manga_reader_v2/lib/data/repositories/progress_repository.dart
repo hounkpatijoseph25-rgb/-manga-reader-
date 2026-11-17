@@ -37,25 +37,58 @@ class ProgressRepository {
     }
   }
 
-  /// Enregistre la position dans un chapitre. Si [read] est vrai, le chapitre est marqué comme lu.
+  /// Enregistre la position dans un chapitre.
+  ///
+  /// [page] sert aux modes paginés, [offset] au mode webtoon (pixels). Si
+  /// [read] est vrai, le chapitre est marqué comme lu et sa position oubliée.
   Future<void> savePosition({
     required String mangaKey,
     required String chapterId,
     required int page,
     required bool read,
+    double? offset,
   }) async {
     final current = get(mangaKey);
     final readIds = {...current.readChapterIds};
     final pages = {...current.lastPage};
+    final offsets = {...current.lastOffset};
     if (read) {
       readIds.add(chapterId);
       pages.remove(chapterId);
+      offsets.remove(chapterId);
     } else {
       pages[chapterId] = page;
+      if (offset != null) offsets[chapterId] = offset;
     }
     await _put(
       mangaKey,
-      MangaProgress(readChapterIds: readIds, lastPage: pages),
+      MangaProgress(
+        readChapterIds: readIds,
+        lastPage: pages,
+        bookmarkedChapterIds: current.bookmarkedChapterIds,
+        lastOffset: offsets,
+      ),
+    );
+  }
+
+  /// Enregistre uniquement la position de défilement (webtoon) sans toucher au
+  /// statut « lu ». Appelée fréquemment pendant le défilement.
+  Future<void> saveOffset({
+    required String mangaKey,
+    required String chapterId,
+    required double offset,
+  }) async {
+    final current = get(mangaKey);
+    if (current.isRead(chapterId)) return; // chapitre déjà terminé : on n'y revient pas
+    final offsets = {...current.lastOffset, chapterId: offset};
+    await _put(
+      mangaKey,
+      MangaProgress(
+        readChapterIds: current.readChapterIds,
+        lastPage: current.lastPage,
+        bookmarkedChapterIds: current.bookmarkedChapterIds,
+        lastOffset: offsets,
+      ),
     );
   }
 
@@ -68,6 +101,7 @@ class ProgressRepository {
     final current = get(mangaKey);
     final readIds = {...current.readChapterIds};
     final pages = {...current.lastPage};
+    final offsets = {...current.lastOffset};
     for (final id in chapterIds) {
       if (read) {
         readIds.add(id);
@@ -75,10 +109,42 @@ class ProgressRepository {
         readIds.remove(id);
       }
       pages.remove(id);
+      offsets.remove(id);
     }
     await _put(
       mangaKey,
-      MangaProgress(readChapterIds: readIds, lastPage: pages),
+      MangaProgress(
+        readChapterIds: readIds,
+        lastPage: pages,
+        bookmarkedChapterIds: current.bookmarkedChapterIds,
+        lastOffset: offsets,
+      ),
+    );
+  }
+
+  /// Ajoute ou retire des chapitres des favoris (marque-page).
+  Future<void> setBookmarked(
+    String mangaKey,
+    Iterable<String> chapterIds,
+    bool bookmarked,
+  ) async {
+    final current = get(mangaKey);
+    final bookmarks = {...current.bookmarkedChapterIds};
+    for (final id in chapterIds) {
+      if (bookmarked) {
+        bookmarks.add(id);
+      } else {
+        bookmarks.remove(id);
+      }
+    }
+    await _put(
+      mangaKey,
+      MangaProgress(
+        readChapterIds: current.readChapterIds,
+        lastPage: current.lastPage,
+        bookmarkedChapterIds: bookmarks,
+        lastOffset: current.lastOffset,
+      ),
     );
   }
 

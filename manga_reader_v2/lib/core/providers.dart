@@ -1,4 +1,7 @@
+import 'dart:io';
+
 import 'package:dio/dio.dart';
+import 'package:dio/io.dart';
 import 'package:flutter/material.dart' show ThemeMode;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -11,23 +14,24 @@ import '../data/models/manga_progress.dart';
 import '../data/repositories/category_repository.dart';
 import '../data/repositories/chapter_cache_repository.dart';
 import '../data/repositories/cover_cache_repository.dart';
+import '../data/repositories/download_queue_repository.dart';
 import '../data/repositories/download_repository.dart';
 import '../data/repositories/history_repository.dart';
 import '../data/repositories/library_repository.dart';
 import '../data/repositories/progress_repository.dart';
 import '../data/repositories/settings_repository.dart';
 import '../data/repositories/updates_repository.dart';
-import '../data/sources/local_source.dart';
+import '../data/sources/downloads_source.dart';
+import '../data/sources/fmteam_source.dart';
 import '../data/sources/lelscan_source.dart';
-import '../data/sources/madara_source.dart';
+import '../data/sources/local_source.dart';
 import '../data/sources/manga_source.dart';
 import '../data/sources/mangadex_source.dart';
 import '../data/sources/poseidon_scans_source.dart';
 import '../data/sources/scan_vf_source.dart';
 import '../data/sources/sushiscan_source.dart';
-import '../data/sources/nhentai_source.dart';
-import '../data/sources/hentaifox_source.dart';
 import '../data/storage/storage_service.dart';
+import 'backup.dart';
 import 'constants.dart';
 import 'utils/network_headers.dart';
 
@@ -37,6 +41,11 @@ import 'utils/network_headers.dart';
 final storageProvider = Provider<StorageService>((ref) {
   throw UnimplementedError('storageProvider doit être fourni dans main()');
 });
+
+/// Sauvegarde / restauration de la base locale (fichier JSON).
+final backupServiceProvider = Provider<BackupService>(
+  (ref) => BackupService(ref.watch(storageProvider)),
+);
 
 final libraryRepositoryProvider = Provider<LibraryRepository>((ref) {
   final s = ref.watch(storageProvider);
@@ -61,6 +70,11 @@ final settingsRepositoryProvider = Provider<SettingsRepository>(
 
 final downloadRepositoryProvider = Provider<DownloadRepository>(
   (ref) => DownloadRepository(ref.watch(storageProvider).downloadsBox),
+);
+
+/// File d'attente persistante des téléchargements (reprise après redémarrage).
+final downloadQueueRepositoryProvider = Provider<DownloadQueueRepository>(
+  (ref) => DownloadQueueRepository(ref.watch(storageProvider).downloadQueueBox),
 );
 
 final chapterCacheRepositoryProvider = Provider<ChapterCacheRepository>(
@@ -227,6 +241,17 @@ class SettingsNotifier extends Notifier<AppSettings> {
       _update(state.copyWith(downloadsDirMode: mode));
 
   void setShowNsfw(bool value) => _update(state.copyWith(showNsfw: value));
+
+  void setNotificationsEnabled(bool value) =>
+      _update(state.copyWith(notificationsEnabled: value));
+
+  /// Garder l'écran allumé pendant la lecture.
+  void setKeepScreenOn(bool value) =>
+      _update(state.copyWith(keepScreenOn: value));
+
+  /// Luminosité du lecteur (`0..1`) ; `-1` = luminosité du système.
+  void setReaderBrightness(double value) =>
+      _update(state.copyWith(readerBrightness: value));
 }
 
 final settingsProvider = NotifierProvider<SettingsNotifier, AppSettings>(
@@ -245,9 +270,33 @@ final dioProvider = Provider<Dio>((ref) {
   );
 });
 
+/// Client dédié aux images de chapitres : plus de connexions simultanées que
+/// le client des pages HTML, et des délais plus courts pour ne jamais bloquer
+/// la file derrière une requête morte.
+final downloadDioProvider = Provider<Dio>((ref) {
+  final client = HttpClient()
+    ..maxConnectionsPerHost = 16
+    ..idleTimeout = const Duration(seconds: 20)
+    ..connectionTimeout = const Duration(seconds: 15)
+    ..autoUncompress = true;
+  final dio = Dio(
+    BaseOptions(
+      connectTimeout: const Duration(seconds: 15),
+      receiveTimeout: const Duration(seconds: 60),
+      sendTimeout: const Duration(seconds: 15),
+      persistentConnection: true,
+      headers: {'User-Agent': AppConstants.userAgent},
+    ),
+  );
+  dio.httpClientAdapter = IOHttpClientAdapter(
+    createHttpClient: () => client,
+  );
+  return dio;
+});
+
 final downloadServiceProvider = Provider<DownloadService>(
   (ref) => DownloadService(
-    ref.watch(dioProvider),
+    ref.watch(downloadDioProvider),
     () => ref.read(settingsProvider).downloadsDir,
   ),
 );
@@ -262,9 +311,9 @@ final mangaDexSourceProvider = Provider<MangaSource>((ref) {
   );
 });
 
-/// Mangas Origines (scraping HTML de mangas-origines.fr).
-final mangasOriginesSourceProvider = Provider<MangaSource>((ref) {
-  return MangasOriginesSource(ref.watch(dioProvider));
+/// FMTeam (scraping HTML de fmteam.fr).
+final fmteamSourceProvider = Provider<MangaSource>((ref) {
+  return FmteamSource(ref.watch(dioProvider));
 });
 
 /// Sushiscan (scraping HTML de sushiscan.net).
@@ -294,35 +343,49 @@ final localSourceProvider = Provider<LocalMangaSource>(
     rootPath: () => ref.read(settingsProvider).localRoot,
     coverOverride: (mangaPath) =>
         ref.read(settingsProvider).localCovers[mangaPath],
+    downloadsRoot: () => ref.read(downloadServiceProvider).downloadsRootPath,
   ),
 );
+
+/// Chapitres téléchargés : relus depuis l'index des téléchargements.
+final downloadsSourceProvider = Provider<MangaSource>((ref) {
+  return DownloadsSource(
+    records: () => ref.read(downloadRepositoryProvider).all(),
+    chapterPages: (manga, chapter) =>
+        ref.read(downloadServiceProvider).localPages(manga, chapter),
+  );
+});
 
 /// En-têtes à joindre à une image (Referer CDN, etc.).
 final urlHeadersProvider = Provider<Map<String, String> Function(String)>(
   (ref) => headersForUrl,
 );
 
-/// nhentai (hentai, réservé aux adultes).
-final nhentaiSourceProvider = Provider<MangaSource>(
-  (ref) => NHentaiSource(ref.watch(dioProvider)),
-);
-
-/// HentaiFox (hentai, réservé aux adultes).
-final hentaifoxSourceProvider = Provider<MangaSource>(
-  (ref) => HentaiFoxSource(ref.watch(dioProvider)),
-);
+/// MangaDex 18+ (même API que MangaDex, contenus érotiques/pornographiques).
+final mangaDexAdultSourceProvider = Provider<MangaSource>((ref) {
+  return MangaDexSource(
+    ref.watch(dioProvider),
+    language: () => ref.read(settingsProvider).contentLanguage,
+    dataSaver: () => ref.read(settingsProvider).dataSaver,
+    id: 'mangadex18',
+    name: 'MangaDex 18+',
+    description: 'MangaDex, contenus réservés aux adultes',
+    adult: true,
+    ratings: const ['erotica', 'pornographic'],
+  );
+});
 
 /// Toutes les sources intégrées (y compris adultes).
 final allSourcesProvider = Provider<List<MangaSource>>((ref) {
   return [
     ref.watch(mangaDexSourceProvider),
-    ref.watch(mangasOriginesSourceProvider),
+    ref.watch(fmteamSourceProvider),
     ref.watch(sushiscanSourceProvider),
     ref.watch(scanVfSourceProvider),
     ref.watch(lelscanSourceProvider),
     ref.watch(poseidonScansSourceProvider),
-    ref.watch(nhentaiSourceProvider),
-    ref.watch(hentaifoxSourceProvider),
+    ref.watch(mangaDexAdultSourceProvider),
+    ref.watch(downloadsSourceProvider),
     ref.watch(localSourceProvider),
   ];
 });

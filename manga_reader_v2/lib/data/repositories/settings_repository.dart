@@ -47,6 +47,9 @@ class AppSettings {
     this.downloadsDir = '',
     this.showNsfw = false,
     this.downloadsDirMode = 'unset',
+    this.notificationsEnabled = true,
+    this.keepScreenOn = true,
+    this.readerBrightness = -1,
   });
 
   final ThemeMode themeMode;
@@ -76,6 +79,15 @@ class AppSettings {
   /// Choix du dossier de téléchargements : `unset`, `internal` ou `custom`.
   final String downloadsDirMode;
 
+  /// Prévenir par une notification quand la veille découvre des chapitres.
+  final bool notificationsEnabled;
+
+  /// Garder l'écran allumé pendant la lecture d'un chapitre.
+  final bool keepScreenOn;
+
+  /// Luminosité du lecteur (`0..1`) ; `-1` = luminosité du système.
+  final double readerBrightness;
+
   AppSettings copyWith({
     ThemeMode? themeMode,
     int? seedIndex,
@@ -90,6 +102,9 @@ class AppSettings {
     String? downloadsDir,
     bool? showNsfw,
     String? downloadsDirMode,
+    bool? notificationsEnabled,
+    bool? keepScreenOn,
+    double? readerBrightness,
   }) {
     return AppSettings(
       themeMode: themeMode ?? this.themeMode,
@@ -106,6 +121,9 @@ class AppSettings {
       downloadsDir: downloadsDir ?? this.downloadsDir,
       showNsfw: showNsfw ?? this.showNsfw,
       downloadsDirMode: downloadsDirMode ?? this.downloadsDirMode,
+      notificationsEnabled: notificationsEnabled ?? this.notificationsEnabled,
+      keepScreenOn: keepScreenOn ?? this.keepScreenOn,
+      readerBrightness: readerBrightness ?? this.readerBrightness,
     );
   }
 }
@@ -163,6 +181,9 @@ class SettingsRepository {
       downloadsDir: downloadsDir,
       showNsfw: (_box.get('showNsfw') as bool?) ?? false,
       downloadsDirMode: downloadsDirMode,
+      notificationsEnabled: (_box.get('notificationsEnabled') as bool?) ?? true,
+      keepScreenOn: (_box.get('keepScreenOn') as bool?) ?? true,
+      readerBrightness: (_box.get('readerBrightness') as num?)?.toDouble() ?? -1,
     );
   }
 
@@ -188,6 +209,9 @@ class SettingsRepository {
       'downloadsDir': s.downloadsDir,
       'showNsfw': s.showNsfw,
       'downloadsDirMode': s.downloadsDirMode,
+      'notificationsEnabled': s.notificationsEnabled,
+      'keepScreenOn': s.keepScreenOn,
+      'readerBrightness': s.readerBrightness,
     });
   }
 }
